@@ -221,10 +221,21 @@ int run_live(const Options& opt) {
         net::steady_timer duration_timer(ioc);
         net::steady_timer stats_timer(ioc);
 
+        // A timer that has already expired can't be cancelled any more: its
+        // handler still runs, with no error. So every handler also checks
+        // `stopping`, otherwise the stats timer could re-arm itself after
+        // shutdown and run() would never return.
+        bool stopping = false;
         auto shutdown = [&](const char* why) {
+            if (stopping) return;
+            stopping = true;
             std::fprintf(stderr, "[main] stopping: %s\n", why);
             client.stop();
+            // cancel() alone keeps SIGINT/SIGTERM registered, so a second Ctrl+C
+            // would be swallowed. clear() gives them back their default action,
+            // which kills the process if the clean stop ever gets stuck.
             signals.cancel();
+            signals.clear();
             duration_timer.cancel();
             stats_timer.cancel();
         };
@@ -239,7 +250,7 @@ int run_live(const Options& opt) {
             });
         }
         std::function<void(const boost::system::error_code&)> on_stats = [&](const boost::system::error_code& e) {
-            if (e) return;
+            if (e || stopping) return;
             metrics.print(stderr, "[stats]");
             stats_timer.expires_after(std::chrono::seconds(10));
             stats_timer.async_wait(on_stats);
