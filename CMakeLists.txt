@@ -44,6 +44,7 @@ target_compile_options(lob_core PRIVATE ${WARNINGS})
 
 add_executable(binance_capture
   src/main.cpp
+  src/rest_client.cpp
   src/ws_client.cpp)
 target_link_libraries(binance_capture PRIVATE lob_core Boost::headers OpenSSL::SSL OpenSSL::Crypto Threads::Threads)
 target_compile_options(binance_capture PRIVATE ${WARNINGS})

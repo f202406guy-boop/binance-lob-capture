@@ -37,6 +37,7 @@ struct Options {
     std::string output_dir = "./output";
     long duration_sec = 0;
     bool busy_poll = false;
+    bool rest_snapshot = false;
     std::vector<std::string> replay_files;
 };
 
@@ -44,7 +45,7 @@ void usage() {
     std::fprintf(stderr,
                  "usage:\n"
                  "  binance_capture --venue spot|usdm --symbols BTCUSDT[,ETHUSDT...] [--output-dir DIR] "
-                 "[--duration SECONDS] [--busy-poll]\n"
+                 "[--duration SECONDS] [--busy-poll] [--rest-snapshot]\n"
                  "  binance_capture --replay FILE[,FILE...] [--output-dir DIR]\n");
 }
 
@@ -96,6 +97,8 @@ bool parse_args(int argc, char** argv, Options& opt) {
             if (opt.duration_sec < 0) return false;
         } else if (arg == "--busy-poll") {
             opt.busy_poll = true;
+        } else if (arg == "--rest-snapshot") {
+            opt.rest_snapshot = true;
         } else if (arg == "--replay") {
             const char* v = next();
             if (!v) return false;
@@ -158,6 +161,9 @@ void run_consumer(MessageQueue& queue, Processor& processor, const std::atomic<b
             std::int64_t end = mono_clock_ns();
             latency.wait.add(start - msg->recv_mono_ns);
             latency.work.add(end - start);
+            // A REST snapshot is ~64 KB. Slots are reused and a string never
+            // gives memory back on its own, so free it instead of keeping it forever.
+            if (msg->kind == StreamKind::RestSnapshot) std::string().swap(msg->payload);
             queue.pop();
             idle = 0;
             continue;
@@ -216,7 +222,7 @@ int run_live(const Options& opt) {
         ssl_ctx.set_default_verify_paths();
         ssl_ctx.set_verify_mode(ssl::verify_peer);
 
-        WsClient client(ioc, ssl_ctx, opt.venue, opt.symbols, *queue, metrics);
+        WsClient client(ioc, ssl_ctx, opt.venue, opt.symbols, *queue, metrics, opt.rest_snapshot);
         net::signal_set signals(ioc, SIGINT, SIGTERM);
         net::steady_timer duration_timer(ioc);
         net::steady_timer stats_timer(ioc);

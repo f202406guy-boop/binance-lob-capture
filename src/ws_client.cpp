@@ -5,7 +5,9 @@
 #include <chrono>
 #include <cstdio>
 #include <thread>
+#include <utility>
 
+#include <boost/asio/post.hpp>
 #include <openssl/err.h>
 #include <openssl/ssl.h>
 
@@ -23,6 +25,11 @@ constexpr int kMaxBackoffMs = 30000;
 
 std::string to_lower(std::string s) {
     for (char& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return s;
+}
+
+std::string to_upper(std::string s) {
+    for (char& c : s) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
     return s;
 }
 
@@ -56,7 +63,7 @@ Endpoint make_endpoint(Venue venue, const std::vector<std::string>& symbols) {
 }
 
 WsClient::WsClient(net::io_context& ioc, ssl::context& ssl_ctx, Venue venue, const std::vector<std::string>& symbols,
-                   MessageQueue& queue, Metrics& metrics)
+                   MessageQueue& queue, Metrics& metrics, bool rest_snapshot)
     : ioc_(ioc),
       ssl_ctx_(ssl_ctx),
       endpoint_(make_endpoint(venue, symbols)),
@@ -65,10 +72,20 @@ WsClient::WsClient(net::io_context& ioc, ssl::context& ssl_ctx, Venue venue, con
       metrics_(metrics),
       resolver_(ioc),
       retry_timer_(ioc),
-      close_timer_(ioc) {
+      close_timer_(ioc),
+      rest_(ioc, ssl_ctx),
+      rest_enabled_(rest_snapshot) {
     for (std::uint32_t i = 0; i < symbols.size(); ++i) {
         std::string lower = to_lower(symbols[i]);
         for (int k = 0; k < 3; ++k) routes_.emplace(lower + kSuffixes[k], Route{i, kKinds[k]});
+        symbols_.push_back(to_upper(symbols[i]));
+    }
+    if (venue == Venue::Spot) {
+        rest_host_ = "api.binance.com";
+        rest_path_ = "/api/v3/depth";
+    } else {
+        rest_host_ = "fapi.binance.com";
+        rest_path_ = "/fapi/v1/depth";
     }
     frame_.reserve(64 * 1024);
 }
@@ -143,6 +160,56 @@ void WsClient::on_ws_handshake(std::uint32_t epoch, beast::error_code ec) {
     std::fprintf(stderr, "[ws] connected epoch=%u wss://%s%s\n", epoch_, host_header_.c_str(),
                  endpoint_.target.c_str());
     read();
+    if (rest_enabled_) {
+        // At most one round of snapshots a minute, so a connection that keeps
+        // dropping can't run through Binance's request weight limit.
+        auto now = std::chrono::steady_clock::now();
+        if (!rest_started_ || now - last_rest_round_ >= std::chrono::seconds(60)) {
+            rest_started_ = true;
+            last_rest_round_ = now;
+            rest_next_ = 0;
+            next_snapshot();
+        } else {
+            std::fprintf(stderr, "[rest] last snapshot round was less than 60 s ago, skipping this one\n");
+        }
+    }
+}
+
+// Fetches the REST snapshots one symbol after another, to keep the request
+// weight low. If a request from an old connection is still in flight we wait
+// for it; its on_snapshot() continues the loop for the current connection.
+void WsClient::next_snapshot() {
+    if (stopping_ || !connected_ || rest_busy_ || rest_next_ >= symbols_.size()) return;
+    std::uint32_t epoch = epoch_;
+    std::uint32_t index = rest_next_;
+    std::string target = rest_path_ + "?symbol=" + symbols_[index] + "&limit=1000";
+    rest_busy_ = true;
+    rest_.get(rest_host_, target, [this, epoch, index](int status, std::string body) {
+        on_snapshot(epoch, index, status, std::move(body));
+    });
+}
+
+void WsClient::on_snapshot(std::uint32_t epoch, std::uint32_t index, int status, std::string body) {
+    rest_busy_ = false;
+    if (stopping_) return;
+    // A snapshot from an old connection is dropped and rest_next_ stays as the
+    // new handshake set it. A failed request was already logged; skip that symbol.
+    if (epoch == epoch_) {
+        if (status == 200) {
+            recv_mono_ns_ = mono_clock_ns();
+            push(Route{index, StreamKind::RestSnapshot}, body, wall_clock_ns());
+            std::fprintf(stderr, "[rest] %s snapshot %zu bytes (epoch=%u)\n", symbols_[index].c_str(), body.size(),
+                         epoch);
+        }
+        ++rest_next_;
+        // 429 = too many requests, 418 = IP banned for not backing off after a
+        // 429. Stop asking on this connection; the books use depth5 seeding.
+        if (status == 429 || status == 418) {
+            std::fprintf(stderr, "[rest] rate limited (HTTP %d), no more snapshots on this connection\n", status);
+            rest_next_ = static_cast<std::uint32_t>(symbols_.size());
+        }
+    }
+    net::post(ioc_, [this] { next_snapshot(); });
 }
 
 void WsClient::read() {
@@ -221,6 +288,7 @@ void WsClient::fail(std::uint32_t epoch, const char* what, beast::error_code ec)
     if (epoch != epoch_ || stopping_) return;
     std::fprintf(stderr, "[ws] %s failed (epoch=%u): %s\n", what, epoch, ec.message().c_str());
     close_socket();
+    connected_ = false;  // so no REST snapshot starts before the next handshake
 
     ++epoch_;
     bump(metrics_.reconnects);
@@ -240,6 +308,7 @@ void WsClient::stop() {
     stopping_ = true;
     retry_timer_.cancel();
     resolver_.cancel();
+    rest_.stop();
     if (!ws_) return;
 
     if (connected_ && ws_->is_open()) {
