@@ -402,7 +402,7 @@ cmp sample/market_data_usdm_BTCUSDT_2026-11-14_orderbook.csv replay_output/marke
 | ASan + UBSan build: unit tests, plus a 25 s live capture of BTCUSDT and ETHUSDT | clean, no leaks |
 | TSan build: unit tests, plus a 25 s live capture of BTCUSDT and ETHUSDT (network thread and book thread both busy) | no data races |
 | SIGINT during a live capture | clean stop; every received message written; files end on a complete line |
-| Live replay vs live capture (spot and USD-M) | byte-identical |
+| Replay vs live capture (spot and USD-M), also from a fresh clone | byte-identical |
 
 On recent kernels, GCC 11's TSan needs ASLR off to start ("unexpected memory mapping"),
 so run it as `setarch $(uname -m) -R ./build-tsan/binance_capture ...`.
@@ -444,4 +444,4 @@ git push origin v1.0.0
 | Live 300 s capture | `./build/binance_capture --venue spot --symbols BTCUSDT --duration 300` |
 | Column count check | `awk -F',' 'NR==2{print NF}' output/*_orderbook.csv` gives `26` |
 | Replay matches live | `./build/binance_capture --replay output/market_data_spot_BTCUSDT_<date>.csv --output-dir replay_output && cmp output/*_orderbook.csv replay_output/*_orderbook.csv` |
-| No secrets in repo | `git grep -i "api_key\|secret\|password"` gives nothing |
+| No secrets in repo | `git grep -i "api_key\|secret\|password"` only matches the `config/secrets.json` ignore rule and this README |
