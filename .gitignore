@@ -1,0 +1,13 @@
+build/
+build-*/
+output/
+replay_output/
+*.csv
+!sample/*.csv
+*.o
+*.a
+*.so
+.env
+config/secrets.json
+.vscode/
+.idea/
