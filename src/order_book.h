@@ -14,9 +14,10 @@ inline bool operator==(const Level& a, const Level& b) {
 }
 
 // One side of the book, kept sorted from worst to best so the best price sits
-// at the back of the vector. Nearly every update touches the top few levels,
-// so inserting or erasing there moves little or no memory, and the whole side
-// stays in one contiguous, cache-friendly block.
+// at the back of the vector and the top 5 are the last 5 elements. Lookup is
+// a binary search. An insert or erase deep in the book shifts the levels above
+// it (a memmove), but the whole side is one contiguous block, which the CPU
+// cache and prefetcher handle well.
 class BookSide {
 public:
     explicit BookSide(bool is_bid);

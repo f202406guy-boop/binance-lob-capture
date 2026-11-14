@@ -54,6 +54,9 @@ cmake -B build-tsan -G Ninja -DCMAKE_BUILD_TYPE=Debug -DENABLE_TSAN=ON   # Threa
 # USD-M futures
 ./build/binance_capture --venue usdm --symbols BTCUSDT --output-dir ./output --duration 120
 
+# lowest latency: the book thread spins instead of sleeping (uses one full core)
+./build/binance_capture --venue spot --symbols BTCUSDT --busy-poll
+
 # replay: rebuild the order book CSV from a market data CSV, no network
 ./build/binance_capture --replay ./output/market_data_spot_BTCUSDT_2026-11-14.csv --output-dir ./replay_output
 
@@ -67,10 +70,32 @@ ctest --test-dir build --output-on-failure      # or ./build/unit_tests
 | `--symbols` | comma separated, case-insensitive, e.g. `BTCUSDT,ETHUSDT` (1 to 50 symbols) |
 | `--output-dir` | where CSVs go (default `./output`, created if missing) |
 | `--duration` | seconds to run, `0` or omitted = until SIGINT/SIGTERM |
+| `--busy-poll` | the book thread never sleeps while waiting for messages: about 1 µs wait instead of ~150 µs, at the cost of one core at 100% (see [Design choices](#design-choices-and-measurements)) |
 | `--replay` | one or more market data CSVs (comma separated) |
 
 For each symbol the program subscribes to `<symbol>@depth@100ms`, `<symbol>@depth5@100ms`
 and `<symbol>@trade` on one combined-stream connection.
+
+## Code layout
+
+| File | What it does |
+|---|---|
+| `src/types.h` | shared names: `Venue`, `StreamKind`, `RawMessage` (one message in the queue), the wall clock |
+| `src/decimal.h` | decimal string → `int64` scaled by 10^8, integer math only |
+| `src/csv.h/.cpp` | CSV quoting and splitting, number → text, `BufferedFile` (256 KB write buffer) |
+| `src/order_book.h/.cpp` | `BookSide`: one side of the book |
+| `src/spsc_queue.h` | lock-free single-producer single-consumer ring between the two threads |
+| `src/metrics.h`, `src/latency.h` | counters and the latency histogram |
+| `src/ws_client.h/.cpp` | network thread: TLS + WebSocket, reconnect with backoff, receive timestamp, push to the ring |
+| `src/processor.h/.cpp` | book thread: JSON → sequence checks → book → CSV rows (live and replay both use it) |
+| `src/replay.h/.cpp` | reads a market data CSV back into `RawMessage`s for the processor |
+| `src/main.cpp` | options, threads, signals, periodic stats |
+| `tests/unit_tests.cpp` | unit tests (`ctest`) |
+| `bench/wait_bench.cpp` | the benchmark behind the `--busy-poll` choice, see [Design choices](#design-choices-and-measurements) |
+
+Headers hold declarations (and the small template/inline code), `.cpp` files hold the
+code. That way `binance_capture` and `unit_tests` link the same `lob_core` library
+without compiling anything twice.
 
 ## Output files
 
@@ -232,7 +257,26 @@ The cost is that right after a seed, the book only knows the top 5 levels plus w
 diffs touch afterwards. If the price moves through the seeded levels before the deeper
 ones have been touched, a level can be missing. The `depth5` check catches exactly this
 and repairs it. In the sample spot run, the only 2 mismatches happened 2 s and 6 s after
-start, followed by 0 in the remaining ~115 s.
+start, followed by 0 in the remaining ~115 s. Over a 10-minute spot run there were 48
+repairs in 6,296 checks (0.8%). Most were bunched at the start (14 in the first minute)
+and during one fast move (22 in minutes 5 and 6). The other minutes had 0 to 4.
+
+**How I would add the REST snapshot without breaking replay:**
+
+1. After each connect, the network thread fetches `GET /api/v3/depth?symbol=X&limit=1000`
+   (spot) or `/fapi/v1/depth` (USD-M) over HTTPS, without blocking the socket read.
+2. It pushes the response into the same queue as a new `stream_kind`, `rest_snapshot`, so
+   it lands in the market data CSV in the order it arrived. Replay then sees exactly what
+   live saw.
+3. Until the snapshot arrives, the book thread buffers diffs instead of dropping them.
+   When it arrives: drop buffered diffs with `u <= lastUpdateId`, check that the first one
+   left spans `lastUpdateId + 1` (spot) or `lastUpdateId` (USD-M), then apply the rest.
+4. After a gap the book thread needs a new snapshot, so it has to signal the network
+   thread (an atomic flag per symbol that a timer checks).
+5. Request weight: `limit=1000` costs 50 on spot against a budget of 6,000 per minute,
+   so 50 symbols fit, but a reconnect storm would have to be spread out.
+
+`depth5` would still do the checking and repairing.
 
 ## Threading and I/O
 
@@ -264,12 +308,17 @@ start, followed by 0 in the remaining ~115 s.
   `fwrite` once per buffer (stdio buffering is turned off, so data is not copied twice).
   The book thread also flushes every second when idle, so files on disk stay current
   during a live run. An idle book thread yields, then sleeps 200 µs, so it does not burn a
-  core when the market is quiet.
+  core when the market is quiet. `--busy-poll` makes it spin instead.
 - **Shutdown.** SIGINT/SIGTERM (or `--duration`) is handled with `asio::signal_set`, so the
   handler runs on the io thread, not in signal context. It stops the timers, sends a
   WebSocket close (forcing the socket closed after 2 s at most), and `io_context::run()`
   returns. The book thread drains whatever is left in the ring, then files are flushed and
-  closed and final counters are printed. All resources are RAII (`BufferedFile` owns its
+  closed and final counters are printed. Every timer handler also checks a `stopping`
+  flag, because a timer that has already expired can't be cancelled (its handler still
+  runs, with no error). Without the flag, a stats timer firing in the same instant as the
+  `--duration` timer re-armed itself and kept `run()` alive forever. After the first
+  signal, SIGINT/SIGTERM get their default action back, so a second Ctrl+C always kills
+  the process. All resources are RAII (`BufferedFile` owns its
   `FILE*`, the socket lives in a `std::optional` recreated per connection). Async handlers
   capture `this` plus the connection epoch, and the client outlives `run()`. A late handler
   from an old connection sees a different epoch and returns without touching anything.
@@ -284,17 +333,95 @@ start, followed by 0 in the remaining ~115 s.
   `b`, `a`, `m`, ...) and unused ones are skipped. Each payload is parsed once on the book
   thread, from the exact bytes that went into the market data file. That is what makes
   replay identical to live.
-- **Order book side = sorted `std::vector<Level>`, best price at the back.** Almost every
-  update hits the top few levels, so `insert`/`erase` there move almost nothing, and lookup
-  is a binary search. The top 5 are simply the last 5 elements. Compared with `std::map`,
-  there is no node allocation per new level and the data is contiguous, which is much
-  friendlier to the cache. The trade-off is that an update deep in the book shifts more
-  elements (O(n) memmove). For the few thousand levels Binance actually sends, that is a
-  handful of cache lines. A flat array indexed by price tick would be O(1) but needs a
-  fixed price band and tick size per symbol.
+- **Order book side = sorted `std::vector<Level>`, best price at the back.** The top 5
+  are the last 5 elements and lookup is a binary search. An insert or erase deep in the
+  book shifts the levels above it (O(n) memmove), but it is one contiguous block with no
+  allocation per level, which suits the CPU cache. A `std::map` is O(log n) per update,
+  but every level is a separately allocated node, so each lookup chases pointers through
+  memory. A flat array indexed by price tick would be O(1), but it needs a fixed price
+  band and tick size per symbol.
 - **One connection for all symbols.** It is simple, and each symbol uses 3 streams, so
   50 symbols is 150 streams, well under Binance's per-connection limit. `shard_id` is in
   the format so multiple connections can be added later.
+
+## Design choices and measurements
+
+All numbers were measured on the dev machine (WSL2 on an Intel Core Ultra 9 285H, GCC
+11.4, Release build). The benchmark that decided a choice is kept in
+[`bench/`](bench/) so it can be rerun. One-off checks are described with the command
+that repeats them.
+
+### Where the time goes
+
+For one depth update, from Binance to a row in our CSV:
+
+| Stage | Time | How it was measured |
+|---|---|---|
+| Binance batches updates (`@100ms` streams) | 0 to 100 ms | how the stream is defined |
+| Network to Binance (spot, from India) | 150 to 200 ms round trip | TCP connect time, `curl -w '%{time_connect}' https://stream.binance.com:9443/` |
+| Hand-off to the book thread (`wait_us`), default | p50 137 to 159 µs, p99 495 to 676 µs | `[latency]` lines, 10 and 5 minute live runs, spot and USD-M |
+| Hand-off to the book thread, `--busy-poll` | p50 0 to 3 µs, p99 157 to 394 µs | same runs, at the same time |
+| Book thread work per message (`work_us`) | p50 under 1 µs; p99 30 to 34 µs spot, 98 to 130 µs USD-M | same runs |
+
+Notes on these numbers:
+
+- Most messages are trades, which take well under a microsecond, so `work_us` p50 is 0
+  or 1. The p99 is the depth diffs. On USD-M they carry about 300 levels each in a busy
+  market.
+- With `--busy-poll`, the p50 drops about 100×, but the p99 only drops a little. The
+  spinning thread is fine, but inside WSL Windows still deschedules the VM's virtual CPUs
+  now and then. On a Linux box with an isolated core that tail would mostly go away.
+- The first runs measured these durations with the wall clock and showed a fake max of
+  1.6 to 2.0 s, which was WSL stepping its clock. They are measured with `steady_clock`
+  now.
+
+Our own code takes microseconds, while the feed's batching and the network take tens to
+hundreds of milliseconds. So making the code faster does not change the end-to-end number
+much. What it does change is the tail (p99, max) and the headroom for 50 symbols.
+
+### Choices
+
+| Choice | Picked | Rejected | Why, with the numbers |
+|---|---|---|---|
+| Waiting for messages | sleep when idle (default), `--busy-poll` option | condition variable | `wait_bench`: sleep p50 225 µs at 5.7% of a core; spin p50 0.9 µs at 100% of a core; condition variable p50 246 µs at 1.4% (waking a thread is slow inside the WSL VM). Spinning is the only way to get to ~1 µs, so it is there as an option. It is not the default because it burns a core. |
+| Clock for latency | `steady_clock` (monotonic) | `system_clock` | The first 10-minute run measured with the wall clock and showed a fake max of 1.6 to 2.0 s. WSL steps its clock when it re-syncs with Windows. Durations need a clock that never jumps. |
+| Prices and sizes | `int64` × 10^8 | `double` | The `depth5` check compares levels for exact equality, and decimals like 0.1 are not exact in binary floating point. |
+| JSON parser | simdjson On-Demand | | In the profile, simdjson's own structure scan is about 3% of replay instructions, so parsing is not where the time goes. |
+| Compiler flags | `-O3` (CMake Release) | `-march=native` | Replay went from 15.8 to 14.9 ms (spot) and 27.1 to 27.3 ms (USD-M): noise. It would also tie the binary to the CPU it was built on. |
+| Includes | the specific standard headers | `<bits/stdc++.h>` | Same speed when running, since headers only declare things. A one-line file takes 0.54 s to compile instead of 0.04 s (130k lines pulled in instead of 14k), and `processor.cpp` goes from 2.4 to 3.3 s. It is also GCC-only. |
+| Seeding the book | first `depth5` | REST `/depth` snapshot | Keeps replay exact (see [Why no REST snapshot](#order-book-sequencing-and-reconnects)). The cost, measured over 10 minutes of spot: 48 repairs in 6,296 checks (0.8%), 14 in the first minute and 22 during one fast move in minutes 5 and 6, while the deep levels were still unknown. |
+
+### Profile
+
+`valgrind --tool=callgrind` on a replay of the USD-M sample, as a share of all
+instructions:
+
+| Where | Share |
+|---|---|
+| `BookSide::set`, almost all of it `memmove` from vector insert/erase | 43% |
+| splitting CSV rows (replay only, live mode never does this) | 24% |
+| turning JSON price levels into integers | 16% |
+| formatting order book rows | 7% |
+| simdjson structure scan | 3% |
+
+The biggest item that live mode also pays for is the book's memmove, and live it is
+still only tens of microseconds at p99 per depth diff (see the table above), well under
+the feed's 100 ms batching.
+
+### Running the benchmark
+
+```bash
+cmake --build build --target wait_bench
+./build/wait_bench
+```
+
+`wait_bench`, 500 messages 10 ms apart:
+
+```
+sleep    p50    225.1 us   p99    659.8 us   max    743.6 us   cpu   5.7% of one core
+spin     p50      0.9 us   p99    158.2 us   max    423.7 us   cpu 106.6% of one core
+condvar  p50    245.8 us   p99    497.8 us   max    832.5 us   cpu   1.4% of one core
+```
 
 ## Metrics
 
@@ -303,6 +430,48 @@ Printed to stderr every 10 s and at exit:
 `messages, md_rows, ob_rows, parse_errors, unknown_streams, reconnects, diffs_applied,
 diffs_stale, diffs_waiting, gaps, book_resets, depth5_applied, depth5_stale, depth5_checked,
 depth5_mismatch, depth5_folded, trades, queue_full_waits, write_errors`
+
+In live mode the book thread also prints latency every 10 s and at exit:
+
+```
+[final latency] n=29194 wait_us p50=2 p99=249 p99.9=744 max=14810 | work_us p50=0 p99=98 p99.9=243 max=6824
+```
+
+(from a 5-minute USD-M run with `--busy-poll`)
+
+| Field | Meaning |
+|---|---|
+| `wait_us` | from reading the frame off the socket to the book thread starting on it: the hand-off through the queue, including any time the book thread was asleep |
+| `work_us` | time inside `Processor::process()`: parse, sync rules, book update, CSV row into the buffer (and the occasional 256 KB write to disk) |
+
+Both are counted in 1 µs buckets (fixed memory, so it can run for days) and reported as
+percentiles. Binance → us latency is not reported, because the local clock is not
+trustworthy enough for that (see [Timestamps](#timestamps)).
+
+## What I would do in production
+
+These matter far more than anything left inside the code, but they are outside the scope
+of a take-home:
+
+- **Run next to Binance.** Binance's servers are widely reported to be in AWS Tokyo
+  (ap-northeast-1). Running the capture there would take the network from tens or
+  hundreds of milliseconds down to about a millisecond. Nothing in the code comes close.
+- **Use Binance's binary market data streams.** Binance offers SBE (binary) market data
+  streams for spot. They have a fixed layout, so there is no JSON to parse. They need an
+  API key, which this project avoids on purpose.
+- **Pin the threads.** Put the network thread and the book thread on their own isolated
+  cores (`isolcpus`, `taskset`) and run with `--busy-poll`, so the spinning thread never
+  gets descheduled.
+- **Price-indexed book.** An array indexed by price tick, around the current price, gives
+  O(1) updates and an O(1) top of book. It needs each symbol's tick size (from
+  `exchangeInfo`) and has to be re-centred when the price moves far.
+- **Writing files off the book thread.** Every 256 KB the book thread does one `fwrite`,
+  which shows up in the `work_us` max. A separate writer thread, or `io_uring`, would take
+  that off the book's path.
+- **A disciplined clock.** With chrony/PTP (or NIC hardware timestamps), `recv - E` would
+  become a real Binance → us latency number.
+- **Several connections.** For 50 busy symbols, spread them over a few connections
+  (`shard_id` is already in the format) so one slow socket does not delay everything.
 
 ## Limits and safety
 
@@ -387,9 +556,12 @@ cmp sample/market_data_usdm_BTCUSDT_2026-11-14_orderbook.csv replay_output/marke
 
 - Replaying the spot sample (5,967 messages) takes about 11 ms end to end on one thread:
   CSV read, JSON parse, book update and CSV write. That is roughly 540k messages/s, or
-  about 1.8 µs per message, with a peak RSS of 6.4 MB.
-- Live, the rate is about 50 messages/s per symbol, so the book thread is idle more than
-  99% of the time. The limit is the feed, not the CPU. `queue_full_waits` stayed 0.
+  about 1.8 µs per message, with a peak RSS of 6.4 MB. The USD-M sample takes about 22 ms,
+  because its diffs carry more levels.
+- Live, the rate was 50 to 200 messages/s per symbol (more in a busy market, mostly
+  trades), so the book thread is idle more than 99% of the time. The limit is the feed,
+  not the CPU. `queue_full_waits` stayed 0 in every run.
+- Live latency inside the program is in [Where the time goes](#where-the-time-goes).
 - The steady state does no heap allocation per message (reused slots, buffers, vectors and
   parsers, see [Threading and I/O](#threading-and-io)).
 
@@ -398,11 +570,14 @@ cmp sample/market_data_usdm_BTCUSDT_2026-11-14_orderbook.csv replay_output/marke
 | Check | Result |
 |---|---|
 | Release build, `-Wall -Wextra -Wpedantic -Wshadow -Wconversion` | no warnings |
-| Unit tests (decimal parser, CSV escaping, book side, spot and USD-M sync, gaps, resets, depth5 check/repair/fold, replay equals live) | pass |
-| ASan + UBSan build: unit tests, plus a 25 s live capture of BTCUSDT and ETHUSDT | clean, no leaks |
-| TSan build: unit tests, plus a 25 s live capture of BTCUSDT and ETHUSDT (network thread and book thread both busy) | no data races |
+| Unit tests (decimal parser, CSV escaping, book side incl. `replace_top` on both sides, latency percentiles, spot and USD-M sync, gaps, resets, depth5 check/repair/fold, replay equals live) | pass |
+| ASan + UBSan build: unit tests, replay of both samples, 20 s live USD-M capture of BTCUSDT and ETHUSDT with `--busy-poll` | clean, no leaks |
+| TSan build: unit tests, 20 s live spot capture of BTCUSDT and ETHUSDT, once default and once with `--busy-poll` (network thread and book thread both busy) | no data races |
 | SIGINT during a live capture | clean stop; every received message written; files end on a complete line |
+| `--duration` 10, 20 and 30 s, which line up with the 10 s stats timer (this hung before the `stopping` fix, found by the ASan run) | each run stops on time (10, 23 and 32 s, including the WebSocket close) and prints its final counters |
 | Replay vs live capture (spot and USD-M), also from a fresh clone | byte-identical |
+| 10-minute live runs, spot and USD-M at the same time, each with and without `--busy-poll` (123k and 98k messages) | 0 gaps, 0 reconnects, 0 parse errors; USD-M 0 `depth5` mismatches, spot 48 repaired |
+| Replay of the four 10-minute live captures (up to 123k messages each) | byte-identical order book files |
 
 On recent kernels, GCC 11's TSan needs ASLR off to start ("unexpected memory mapping"),
 so run it as `setarch $(uname -m) -R ./build-tsan/binance_capture ...`.
