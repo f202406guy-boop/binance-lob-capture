@@ -258,6 +258,89 @@ void test_usdm_sync(const fs::path& dir) {
     p.close();
 }
 
+void test_rest_snapshot(const fs::path& dir) {
+    Metrics m;
+    Processor p(Venue::Spot, m);
+    CHECK(p.add_symbol(SymbolOutput{"BTCUSDT", (dir / "market_data_rest.csv").string(), (dir / "ob_rest.csv").string()}));
+    Feeder feed{p, {}};
+    feed.msg.recv_ns = 1700000000LL * 1000000000LL;
+    const SymbolState& s = p.state(0);
+
+    feed(StreamKind::Depth5, R"({"lastUpdateId":100,"bids":[["10.00","1"]],"asks":[["10.10","3"]]})");
+    feed(StreamKind::DepthDiff, R"({"e":"depthUpdate","E":1,"s":"BTCUSDT","U":101,"u":103,"b":[["9.95","5"]],"a":[]})");
+    feed(StreamKind::DepthDiff, R"({"e":"depthUpdate","E":2,"s":"BTCUSDT","U":104,"u":106,"b":[],"a":[["10.20","4"]]})");
+    CHECK(s.valid && s.last_update_id == 106);
+
+    // snapshot behind the live book: caught up with the kept diffs, then swapped in
+    feed(StreamKind::RestSnapshot,
+         R"({"lastUpdateId":102,"bids":[["10.00","1"],["9.90","2"],["9.80","7"]],"asks":[["10.10","3"],["10.30","6"]]})");
+    CHECK(m.rest_snapshots == 1 && m.rest_applied == 1 && !s.rest_pending);
+    CHECK(s.last_update_id == 106);
+    CHECK(s.bids.level(1) == (Level{995000000, 500000000}));
+    CHECK(s.bids.level(2) == (Level{990000000, 200000000}));
+    CHECK(s.bids.level(3) == (Level{980000000, 700000000}));
+    CHECK(s.asks.level(1) == (Level{1020000000, 400000000}));
+    CHECK(s.asks.level(2) == (Level{1030000000, 600000000}));
+    CHECK(m.rest_top_mismatch == 1);  // the live book only knew 2 bid levels
+
+    // snapshot ahead of the live book: waits until a diff brings both to the same id
+    feed(StreamKind::RestSnapshot,
+         R"({"lastUpdateId":110,"bids":[["10.00","1"],["9.95","5"],["9.70","9"]],"asks":[["10.10","3"],["10.20","4"]]})");
+    CHECK(s.rest_pending && m.rest_applied == 1);
+    feed(StreamKind::DepthDiff, R"({"e":"depthUpdate","E":3,"s":"BTCUSDT","U":107,"u":108,"b":[["9.60","1"]],"a":[]})");
+    CHECK(s.rest_pending && s.last_update_id == 108);
+    feed(StreamKind::DepthDiff, R"({"e":"depthUpdate","E":4,"s":"BTCUSDT","U":109,"u":112,"b":[],"a":[["10.40","8"]]})");
+    CHECK(!s.rest_pending && m.rest_applied == 2 && s.last_update_id == 112);
+    CHECK(s.bids.level(2) == (Level{970000000, 900000000}));
+    CHECK(s.bids.size() == 3);  // 9.60 was gone again by id 110
+    CHECK(s.asks.level(2) == (Level{1040000000, 800000000}));
+
+    // snapshot so old that the kept diffs don't connect to it: dropped, book untouched
+    feed(StreamKind::RestSnapshot, R"({"lastUpdateId":50,"bids":[["1.00","1"]],"asks":[["2.00","1"]]})");
+    CHECK(m.rest_dropped == 1 && !s.rest_pending && m.rest_applied == 2);
+    CHECK(s.bids.level(0) == (Level{1000000000, 100000000}));
+
+    // after a reconnect the book is reset; a snapshot seeds it straight away
+    feed(StreamKind::DepthDiff, R"({"e":"depthUpdate","E":5,"s":"BTCUSDT","U":113,"u":115,"b":[],"a":[]})", 1);
+    CHECK(!s.valid);
+    feed(StreamKind::RestSnapshot, R"({"lastUpdateId":200,"bids":[["10.00","2"]],"asks":[["10.10","2"]]})", 1);
+    CHECK(s.valid && s.last_update_id == 200 && m.rest_applied == 3);
+    feed(StreamKind::DepthDiff, R"({"e":"depthUpdate","E":6,"s":"BTCUSDT","U":201,"u":205,"b":[["10.00","4"]],"a":[]})", 1);
+    CHECK(s.last_update_id == 205 && s.bids.level(0).qty == 400000000);
+
+    // a gap in the live book while a continuous REST book is pending: reset, then the REST book takes over
+    feed(StreamKind::RestSnapshot, R"({"lastUpdateId":210,"bids":[["10.00","4"],["9.00","1"]],"asks":[["10.10","2"]]})", 1);
+    CHECK(s.rest_pending);
+    feed(StreamKind::DepthDiff, R"({"e":"depthUpdate","E":7,"s":"BTCUSDT","U":208,"u":212,"b":[],"a":[]})", 1);
+    CHECK(m.gaps == 1 && s.valid && s.last_update_id == 212 && m.rest_applied == 4);
+    CHECK(s.bids.level(1) == (Level{900000000, 100000000}));
+
+    p.close();
+    Metrics rm;
+    fs::path replay_dir = dir / "replay_rest";
+    fs::create_directories(replay_dir);
+    CHECK(replay_file((dir / "market_data_rest.csv").string(), replay_dir.string(), rm));
+    CHECK(read_file(dir / "ob_rest.csv") == read_file(replay_dir / "market_data_rest_orderbook.csv"));
+    CHECK(rm.rest_applied == 4);
+
+    // usdm: the snapshot id falls inside a diff's range, pu decides continuity
+    Metrics um;
+    Processor up(Venue::Usdm, um);
+    CHECK(up.add_symbol(SymbolOutput{"BTCUSDT", "", (dir / "ob_rest_usdm.csv").string()}));
+    Feeder ufeed{up, {}};
+    const SymbolState& us = up.state(0);
+    ufeed(StreamKind::Depth5,
+          R"({"e":"depthUpdate","E":1,"T":1,"s":"BTCUSDT","U":40,"u":50,"pu":39,"b":[["100.0","1"]],"a":[["100.1","1"]]})");
+    ufeed(StreamKind::DepthDiff,
+          R"({"e":"depthUpdate","E":2,"T":2,"s":"BTCUSDT","U":51,"u":60,"pu":50,"b":[["99.9","2"]],"a":[]})");
+    ufeed(StreamKind::RestSnapshot,
+          R"({"lastUpdateId":55,"E":2,"T":2,"bids":[["100.0","1"],["99.5","3"]],"asks":[["100.1","1"]]})");
+    CHECK(um.rest_applied == 1 && us.last_update_id == 60);
+    CHECK(us.bids.level(1) == (Level{9990000000, 200000000}));
+    CHECK(us.bids.level(2) == (Level{9950000000, 300000000}));
+    up.close();
+}
+
 }  // namespace
 
 int main() {
@@ -271,6 +354,7 @@ int main() {
     test_latency();
     test_spot_sync(dir);
     test_usdm_sync(dir);
+    test_rest_snapshot(dir);
 
     if (failures == 0) {
         std::printf("all tests passed\n");

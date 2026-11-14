@@ -22,6 +22,20 @@ constexpr const char* kOrderbookHeader =
 
 constexpr int kBookDepth = 5;
 
+// How many recent diffs each symbol keeps (3 s at 100 ms) so a REST snapshot
+// that arrives a bit later can be brought forward to the live book's id.
+constexpr std::size_t kRecentDiffs = 30;
+
+// One parsed depth message (diff, depth5 or REST snapshot).
+struct DepthMsg {
+    std::uint64_t first_id = 0;  // U
+    std::uint64_t last_id = 0;   // u, or lastUpdateId on spot depth5 and REST
+    std::uint64_t prev_id = 0;   // pu (usdm only)
+    bool has_prev = false;
+    std::vector<Level> bids;
+    std::vector<Level> asks;
+};
+
 struct SymbolOutput {
     std::string symbol;
     std::string market_data_path;  // empty in replay mode
@@ -42,6 +56,17 @@ struct SymbolState {
     std::uint64_t check_id = 0;
     std::vector<Level> check_bids;
     std::vector<Level> check_asks;
+
+    // REST snapshot: the last few diffs (a ring), and a full-depth book built
+    // from a snapshot that is still catching up with the live book.
+    std::vector<DepthMsg> recent;
+    std::size_t recent_next = 0;
+    std::size_t recent_count = 0;
+    bool rest_pending = false;
+    std::uint64_t rest_id = 0;
+    BookSide rest_bids{true};
+    BookSide rest_asks{false};
+
     BufferedFile market_data;
     BufferedFile orderbook;
 };
@@ -62,18 +87,15 @@ public:
     const SymbolState& state(std::size_t i) const { return *symbols_[i]; }
 
 private:
-    struct DepthMsg {
-        std::uint64_t first_id = 0;  // U
-        std::uint64_t last_id = 0;   // u, or lastUpdateId on spot depth5
-        std::uint64_t prev_id = 0;   // pu (usdm only)
-        bool has_prev = false;
-        std::vector<Level> bids;
-        std::vector<Level> asks;
-    };
-
     void on_diff(SymbolState& s, RawMessage& msg);
+    void apply_diff(SymbolState& s, RawMessage& msg);
     void on_depth5(SymbolState& s, RawMessage& msg);
     void on_trade(SymbolState& s, RawMessage& msg);
+    void on_rest_snapshot(SymbolState& s, RawMessage& msg);
+    void remember_diff(SymbolState& s);
+    void advance_rest_book(SymbolState& s, const DepthMsg& d);
+    void try_rest_swap(SymbolState& s, const RawMessage& msg);
+    std::uint64_t prev_update_id(const DepthMsg& d) const;
     bool parse_depth(std::string& payload);
     void verify_top(SymbolState& s, const RawMessage& msg, const std::vector<Level>& bids,
                     const std::vector<Level>& asks);

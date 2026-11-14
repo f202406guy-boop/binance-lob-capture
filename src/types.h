@@ -19,7 +19,10 @@ inline std::int64_t mono_clock_ns() {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
         .count();
 }
-enum class StreamKind : std::uint8_t { DepthDiff, Depth5, Trade };
+// RestSnapshot is not a WebSocket stream: it is the REST /depth response
+// (only with --rest-snapshot), written to the market data file like the rest
+// so replay sees exactly what live saw.
+enum class StreamKind : std::uint8_t { DepthDiff, Depth5, Trade, RestSnapshot };
 
 inline const char* venue_name(Venue v) {
     return v == Venue::Spot ? "spot" : "usdm";
@@ -30,6 +33,7 @@ inline const char* stream_kind_name(StreamKind k) {
     case StreamKind::DepthDiff: return "depth_diff";
     case StreamKind::Depth5: return "depth5";
     case StreamKind::Trade: return "trade";
+    case StreamKind::RestSnapshot: return "rest_snapshot";
     }
     return "unknown";
 }
@@ -44,6 +48,7 @@ inline bool parse_stream_kind(std::string_view s, StreamKind& out) {
     if (s == "depth_diff") { out = StreamKind::DepthDiff; return true; }
     if (s == "depth5") { out = StreamKind::Depth5; return true; }
     if (s == "trade") { out = StreamKind::Trade; return true; }
+    if (s == "rest_snapshot") { out = StreamKind::RestSnapshot; return true; }
     return false;
 }
 

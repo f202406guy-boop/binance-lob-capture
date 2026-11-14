@@ -29,6 +29,10 @@ struct Metrics {
     Counter depth5_mismatch{0};
     Counter depth5_folded{0};
     Counter trades{0};
+    Counter rest_snapshots{0};
+    Counter rest_applied{0};
+    Counter rest_dropped{0};
+    Counter rest_top_mismatch{0};
     Counter write_errors{0};
 
     void print(std::FILE* out, const char* tag) const {
@@ -37,11 +41,13 @@ struct Metrics {
                      "%s messages=%llu md_rows=%llu ob_rows=%llu parse_errors=%llu unknown_streams=%llu "
                      "reconnects=%llu diffs_applied=%llu diffs_stale=%llu diffs_waiting=%llu gaps=%llu "
                      "book_resets=%llu depth5_applied=%llu depth5_stale=%llu depth5_checked=%llu "
-                     "depth5_mismatch=%llu depth5_folded=%llu trades=%llu queue_full_waits=%llu "
+                     "depth5_mismatch=%llu depth5_folded=%llu trades=%llu rest_snapshots=%llu "
+                     "rest_applied=%llu rest_dropped=%llu rest_top_mismatch=%llu queue_full_waits=%llu "
                      "write_errors=%llu\n",
                      tag, v(messages), v(md_rows), v(ob_rows), v(parse_errors), v(unknown_streams),
                      v(reconnects), v(diffs_applied), v(diffs_stale), v(diffs_waiting), v(gaps),
                      v(book_resets), v(depth5_applied), v(depth5_stale), v(depth5_checked),
-                     v(depth5_mismatch), v(depth5_folded), v(trades), v(queue_full_waits), v(write_errors));
+                     v(depth5_mismatch), v(depth5_folded), v(trades), v(rest_snapshots), v(rest_applied),
+                     v(rest_dropped), v(rest_top_mismatch), v(queue_full_waits), v(write_errors));
     }
 };

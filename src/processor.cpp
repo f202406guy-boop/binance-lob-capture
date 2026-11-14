@@ -1,6 +1,7 @@
 #include "processor.h"
 
 #include <cstdio>
+#include <utility>
 
 #include "decimal.h"
 
@@ -99,6 +100,7 @@ void Processor::process(RawMessage& msg) {
         case StreamKind::DepthDiff: on_diff(s, msg); break;
         case StreamKind::Depth5: on_depth5(s, msg); break;
         case StreamKind::Trade: on_trade(s, msg); break;
+        case StreamKind::RestSnapshot: on_rest_snapshot(s, msg); break;
         }
     } catch (const simdjson::simdjson_error&) {
         count_parse_error(s, stream_kind_name(msg.kind));
@@ -106,26 +108,25 @@ void Processor::process(RawMessage& msg) {
 }
 
 void Processor::on_diff(SymbolState& s, RawMessage& msg) {
+    if (!parse_depth(msg.payload) || (venue_ == Venue::Usdm && !depth_.has_prev)) {
+        count_parse_error(s, "depth_diff");
+        return;
+    }
+    // Every diff is kept for a while and also moves a pending REST book
+    // forward. Without --rest-snapshot nothing else happens with them.
+    remember_diff(s);
+    advance_rest_book(s, depth_);
+    apply_diff(s, msg);
+    try_rest_swap(s, msg);
+}
+
+void Processor::apply_diff(SymbolState& s, RawMessage& msg) {
     if (!s.valid) {
         bump(metrics_.diffs_waiting);
         return;
     }
-    if (!parse_depth(msg.payload)) {
-        count_parse_error(s, "depth_diff");
-        return;
-    }
 
-    std::uint64_t prev = 0;
-    if (venue_ == Venue::Usdm) {
-        if (!depth_.has_prev) {
-            count_parse_error(s, "depth_diff");
-            return;
-        }
-        prev = depth_.prev_id;
-    } else {
-        prev = depth_.first_id > 0 ? depth_.first_id - 1 : 0;
-    }
-
+    std::uint64_t prev = prev_update_id(depth_);
     if (depth_.last_id <= s.last_update_id) {
         bump(metrics_.diffs_stale);
         return;
@@ -240,6 +241,80 @@ void Processor::on_trade(SymbolState& s, RawMessage& msg) {
     write_book_row(s, msg, 'T', buyer_is_maker ? 'S' : 'B');
 }
 
+// REST /depth snapshot (up to 1000 levels a side). It is a moment in time
+// with its own update id, which is usually a little behind or ahead of the
+// live book. Build a full-depth book from it, bring it forward with the diffs
+// we kept, and swap it in once both books are at the same update id.
+void Processor::on_rest_snapshot(SymbolState& s, RawMessage& msg) {
+    if (!parse_depth(msg.payload) || (depth_.bids.empty() && depth_.asks.empty()) ||
+        !sorted_best_first(depth_.bids, true) || !sorted_best_first(depth_.asks, false)) {
+        count_parse_error(s, "rest_snapshot");
+        return;
+    }
+    bump(metrics_.rest_snapshots);
+
+    s.rest_bids.clear();
+    s.rest_asks.clear();
+    s.rest_bids.replace_top(depth_.bids);
+    s.rest_asks.replace_top(depth_.asks);
+    s.rest_id = depth_.last_id;
+    s.rest_pending = true;
+
+    std::size_t oldest = (s.recent_next + kRecentDiffs - s.recent_count) % kRecentDiffs;
+    for (std::size_t k = 0; k < s.recent_count; ++k) advance_rest_book(s, s.recent[(oldest + k) % kRecentDiffs]);
+    try_rest_swap(s, msg);
+}
+
+void Processor::remember_diff(SymbolState& s) {
+    if (s.recent.size() != kRecentDiffs) s.recent.resize(kRecentDiffs);
+    s.recent[s.recent_next] = depth_;
+    s.recent_next = (s.recent_next + 1) % kRecentDiffs;
+    if (s.recent_count < kRecentDiffs) ++s.recent_count;
+}
+
+// Same sequence rules as the live book: skip what the snapshot already has,
+// and give up on the snapshot if a diff is missing.
+void Processor::advance_rest_book(SymbolState& s, const DepthMsg& d) {
+    if (!s.rest_pending || d.last_id <= s.rest_id) return;
+    if (prev_update_id(d) > s.rest_id) {
+        s.rest_pending = false;
+        bump(metrics_.rest_dropped);
+        return;
+    }
+    for (const Level& lv : d.bids) s.rest_bids.set(lv.price, lv.qty);
+    for (const Level& lv : d.asks) s.rest_asks.set(lv.price, lv.qty);
+    s.rest_id = d.last_id;
+}
+
+void Processor::try_rest_swap(SymbolState& s, const RawMessage& msg) {
+    if (!s.rest_pending) return;
+    if (s.valid && s.rest_id != s.last_update_id) return;  // one of them still has to catch up
+
+    // Both books are at the same id now, so their top 5 should agree.
+    if (s.valid) {
+        for (int i = 0; i < kBookDepth; ++i) {
+            if (!(s.bids.level(i) == s.rest_bids.level(i)) || !(s.asks.level(i) == s.rest_asks.level(i))) {
+                bump(metrics_.rest_top_mismatch);
+                break;
+            }
+        }
+    }
+    std::swap(s.bids, s.rest_bids);
+    std::swap(s.asks, s.rest_asks);
+    s.rest_bids.clear();
+    s.rest_asks.clear();
+    s.rest_pending = false;
+    s.last_update_id = s.rest_id;
+    s.valid = true;
+    bump(metrics_.rest_applied);
+    write_book_row(s, msg, 'S', 'N');
+}
+
+std::uint64_t Processor::prev_update_id(const DepthMsg& d) const {
+    if (venue_ == Venue::Usdm) return d.prev_id;
+    return d.first_id > 0 ? d.first_id - 1 : 0;
+}
+
 bool Processor::parse_depth(std::string& payload) {
     depth_.first_id = 0;
     depth_.last_id = 0;
@@ -276,6 +351,9 @@ void Processor::reset_book(SymbolState& s, const RawMessage& msg) {
     s.valid = false;
     s.last_update_id = 0;
     s.check_pending = false;
+    // The kept diffs and a pending REST book stay: update ids are global, so
+    // advance_rest_book still catches any hole, and a REST book that is still
+    // continuous is swapped in right after this reset.
     bump(metrics_.book_resets);
     write_book_row(s, msg, 'R', 'N');
 }
