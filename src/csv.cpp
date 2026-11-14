@@ -88,6 +88,6 @@ bool BufferedFile::flush() {
 void BufferedFile::close() {
     if (!file_) return;
     flush();
-    std::fclose(file_);
+    if (std::fclose(file_) != 0) ++write_errors_;
     file_ = nullptr;
 }
