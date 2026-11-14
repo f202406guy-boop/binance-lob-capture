@@ -32,8 +32,11 @@ cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build --parallel
 ```
 
-Warnings are on for our code: `-Wall -Wextra -Wpedantic -Wshadow -Wconversion`. The build
-is warning-free. The default build type is `Release` (`-O3 -DNDEBUG`).
+Warnings are on for our code:
+`-Wall -Wextra -Wpedantic -Wshadow -Wconversion -Wno-sign-conversion`. I turned
+`-Wsign-conversion` off because mixing `size_t` indices with signed counts made it noisy.
+`-Wconversion` still catches narrowing. The build is warning-free. The default build type
+is `Release` (`-O3 -DNDEBUG`).
 
 Sanitizer builds:
 
@@ -60,21 +63,26 @@ cmake -B build-tsan -G Ninja -DCMAKE_BUILD_TYPE=Debug -DENABLE_TSAN=ON   # Threa
 # full-depth book: also fetch the REST /depth snapshot after every connect
 ./build/binance_capture --venue spot --symbols BTCUSDT --rest-snapshot
 
+# several symbols, at most 2 REST snapshot requests in flight at once (default 4, max 8)
+./build/binance_capture --venue spot --symbols BTCUSDT,ETHUSDT,SOLUSDT --rest-snapshot --rest-parallel 2
+
 # replay: rebuild the order book CSV from a market data CSV, no network
 ./build/binance_capture --replay ./output/market_data_spot_BTCUSDT_2026-11-14.csv --output-dir ./replay_output
 
 # unit tests
-ctest --test-dir build --output-on-failure      # or ./build/unit_tests
+cmake --build build --target tests      # builds only the unit tests (the full build above already did)
+./build/tests/unit_tests                # or: (cd build && ctest --output-on-failure)
 ```
 
 | Option | Meaning |
 |---|---|
 | `--venue spot\|usdm` | `spot` = `wss://stream.binance.com:9443/stream`, `usdm` = `wss://fstream.binance.com/public/stream` |
-| `--symbols` | comma separated, case-insensitive, e.g. `BTCUSDT,ETHUSDT` (1 to 50 symbols) |
+| `--symbols` | comma separated, e.g. `BTCUSDT,ETHUSDT` (1 to 50 symbols). The input is uppercased first, then each symbol must be letters and digits only |
 | `--output-dir` | where CSVs go (default `./output`, created if missing) |
-| `--duration` | seconds to run, `0` or omitted = until SIGINT/SIGTERM |
+| `--duration` | seconds to run, `0` or omitted = until SIGINT/SIGTERM. A value that is not a whole number `>= 0` is rejected |
 | `--busy-poll` | the book thread never sleeps while waiting for messages: about 1 µs wait instead of ~150 µs, at the cost of one core at 100% (see [Design choices](#design-choices-and-measurements)) |
 | `--rest-snapshot` | after every connect, fetch each symbol's REST `/depth` snapshot (1000 levels a side) and merge it into the book, see [REST snapshot](#rest-snapshot---rest-snapshot). Off by default |
+| `--rest-parallel N` | with `--rest-snapshot`: up to N REST snapshot requests in flight at once, one symbol each. 1 to 8, default 4 (see [REST snapshot](#rest-snapshot---rest-snapshot)) |
 | `--replay` | one or more market data CSVs (comma separated) |
 
 For each symbol the program subscribes to `<symbol>@depth@100ms`, `<symbol>@depth5@100ms`
@@ -91,12 +99,14 @@ and `<symbol>@trade` on one combined-stream connection.
 | `src/spsc_queue.h` | lock-free single-producer single-consumer ring between the two threads |
 | `src/metrics.h`, `src/latency.h` | counters and the latency histogram |
 | `src/ws_client.h/.cpp` | network thread: TLS + WebSocket, reconnect with backoff, receive timestamp, push to the ring |
-| `src/rest_client.h/.cpp` | async HTTPS GET on the same thread, for the optional REST depth snapshot |
+| `src/rest_client.h/.cpp` | async HTTPS GET on the same thread, for the optional REST depth snapshot (one client per request in flight, `--rest-parallel` of them) |
 | `src/processor.h/.cpp` | book thread: JSON → sequence checks → book → CSV rows (live and replay both use it) |
 | `src/replay.h/.cpp` | reads a market data CSV back into `RawMessage`s for the processor |
 | `src/main.cpp` | options, threads, signals, periodic stats |
-| `tests/unit_tests.cpp` | unit tests (`ctest`) |
+| `tests/unit_tests.cpp` | unit tests (`ctest`, binary `build/tests/unit_tests`) |
+| `tests/verify_against_rest.cpp` | full-depth accuracy check against REST `/depth` snapshots saved by another process (target `verify_against_rest`, not part of `ctest`), see [Full-depth accuracy](#full-depth-accuracy-against-binance) |
 | `bench/wait_bench.cpp` | the benchmark behind the `--busy-poll` choice, see [Design choices](#design-choices-and-measurements) |
+| `bench/rest_parallel_bench.sh` | the live benchmark behind the `--rest-parallel` default, see [Running the benchmarks](#running-the-benchmarks) |
 
 Headers hold declarations (and the small template/inline code), `.cpp` files hold the
 code. That way `binance_capture` and `unit_tests` link the same `lob_core` library
@@ -133,8 +143,10 @@ newline is wrapped in quotes and inner quotes are doubled), header in the first 
 | `symbol` | uppercase |
 | `payload_json` | the inner `data` object, minified, CSV-escaped |
 
-There is one row for every message read from the socket, in the order it was read. This is
-also the order the order book thread processes them in.
+There is one row for every message read from the socket, in the order it was read, except
+frames with an unknown stream name or an envelope that does not parse. Those are counted in
+`unknown_streams` / `parse_errors` and not written. This is also the order the order book
+thread processes them in.
 
 ### Order book CSV
 
@@ -161,15 +173,21 @@ Missing levels (fewer than 5 on a side) are written as `0` price and `0` size.
 | `type` | Event | `side` |
 |---|---|---|
 | `D` | a `depthUpdate` was applied | `B` if it only touched bids, `S` if only asks, `N` if both or empty |
-| `S` | a `depth5` snapshot seeded the book (at start or after a reset) or repaired it after a mismatch | `N` |
-| `T` | a trade printed. The book is **not** changed, the row only marks the trade | aggressor: `m=true` (buyer is maker) gives `S`, `m=false` gives `B` |
+| `S` | a `depth5` was applied: it seeded the book (at start or after a reset), repaired it after a mismatch, or was folded in on USD-M (see [below](#order-book-sequencing-and-reconnects)). A folded snapshot's `S` row comes right before the `D` row of the diff it was folded into, with that diff's receive time. A REST snapshot swap also writes an `S` row | `N` |
+| `T` | a trade printed while the book is valid (no `T` rows before the first seed or between a reset and the next seed). The book is **not** changed, the row only marks the trade | aggressor: `m=true` (buyer is maker) gives `S`, `m=false` gives `B` |
 | `R` | the book was reset (sequence gap or new `conn_epoch`), all levels are 0 | `N` |
+
+Every applied `depth5` writes its own `S` row. A `depth5` that only confirms the book (same
+id, same top 5) changes nothing and writes no row; it is counted in `depth5_checked`. So the
+number of `S` rows is `depth5_applied + rest_applied`.
 
 ## Scaling
 
 Binance sends prices and quantities as decimal strings. Both are converted to `int64` with a
 fixed scale of **10^8** (8 decimal places), straight from the string with integer math:
-`"65000.12000000"` becomes `6500012000000`. No `float`/`double` is used anywhere.
+`"65000.12000000"` becomes `6500012000000`. No `float`/`double` is used anywhere on the
+price/size path. Only reporting code uses `double` (the latency percentiles, the replay
+timer and the benchmarks).
 
 The parser rejects anything that is not a plain non-negative decimal, more than 8 non-zero
 decimal places (it would lose precision), and values that do not fit in `int64`. The largest
@@ -188,10 +206,13 @@ time over Binance's `E` field because spot `depth5` messages have no event time 
 `E` could not be used for every row. Also, receive time is what replay reads back from the
 market data file, which keeps replay exact.
 
-Receive time is only as good as the local clock. In the sample run (WSL2), `recv` was about
-1.7 s *earlier* than Binance's `E`, which means the VM clock was behind. That is also why I
-don't report latency as `recv - E`. On a real box the clock would be disciplined with
-chrony/PTP.
+Receive time is only as good as the local clock. In the sample run (WSL2), `recv - E`
+drifted from about -1.7 s to -2.3 s, which means the VM clock was behind Binance and
+falling further behind. Then WSL's time sync stepped the clock about +2.4 s, at
+recv 1794656935.886 (spot file line 3227, USD-M file line 3009). So `tsec`/`tnsec` in the
+sample contain one jump of ~2.4 s. That is also why I don't report latency as `recv - E`,
+and why durations are measured with `steady_clock`. On a real box the clock would be
+disciplined with chrony/PTP.
 
 ## Order book, sequencing and reconnects
 
@@ -231,14 +252,21 @@ A kept snapshot is resolved by the next diff that gets applied:
   arrives a few ms before the diff with the same id. The diff is applied first, then the
   two are compared as above.
 - **The diff's range contains the snapshot id.** This is normal on USD-M, where `depth5` and
-  diffs are cut about 25 ms apart, so their ids never line up. An exact comparison is
-  impossible, so the snapshot is **folded in** just before the diff is applied
-  (`depth5_folded`). This is safe: the diff carries every change from `last` up to its
-  `u`, so any level the snapshot made stale is overwritten, and the book ends exact at `u`.
-  Folding also fills in any top levels we were missing.
+  diffs are cut about 25 ms apart, so their ids usually do not line up. In the sample, 318
+  of the 1,214 `depth5` had an id equal to a diff's `u` and were compared exactly, and the
+  other 895 were folded (the remaining one seeded the book). When the ids don't line up, an
+  exact comparison is not possible, so the snapshot is **folded in** just before the diff
+  is applied (`depth5_folded`) and gets its own `S` row, right before the diff's `D` row and
+  with the diff's receive time. The top 5 in that `S` row are exactly what Binance
+  published in that `depth5`. This is safe: the diff carries every change from `last` up
+  to its `u`, so any level the snapshot made stale is overwritten, and the book ends exact
+  at `u`. Folding also fills in any top levels we were missing.
+
+Every applied `depth5` (seed, repair or fold) writes its own `S` row. One that only confirms
+the book writes none.
 
 I found the spot/USD-M difference by looking at the captured ids. On spot, the `depth5`
-`lastUpdateId` equals a diff's `u`. On USD-M, the `depth5` `u` always falls inside the
+`lastUpdateId` equals a diff's `u`. On USD-M, the `depth5` `u` usually falls inside the
 next diff's `U..u`.
 
 **Trades** never change the book. A `T` row is written only to annotate when a trade printed
@@ -270,9 +298,9 @@ goes into the market data file as its own row type:
 
 1. After every WebSocket connect, the network thread fetches
    `GET /api/v3/depth?symbol=X&limit=1000` (spot) or `/fapi/v1/depth?...&limit=1000`
-   (USD-M) for each symbol, one after another. The request is async on the same
-   `io_context`, so the socket read is never blocked, and TLS peer and hostname
-   verification are on like for the WebSocket.
+   (USD-M) for each symbol, up to `--rest-parallel` at a time (default 4). The requests
+   are async on the same `io_context`, so the socket read is never blocked, and TLS peer
+   and hostname verification are on like for the WebSocket.
 2. The response is pushed into the same queue as `stream_kind = rest_snapshot`, so it lands
    in the market data CSV in the order it arrived. Replay sees exactly what live saw and
    needs no flag.
@@ -288,14 +316,34 @@ goes into the market data file as its own row type:
    compared (`rest_top_mismatch`): a difference means the live book was missing a level.
 5. `depth5` keeps doing the checking and repairing exactly as before.
 
-Without `--rest-snapshot` there are no `rest_snapshot` rows, and the order book output is
-byte for byte the same as before.
+Without `--rest-snapshot` there are no `rest_snapshot` rows, so the REST code never changes
+the book or the order book file.
 
 **Request weight.** `limit=1000` costs 50 on spot (budget 6,000 a minute) and 20 on USD-M
 (budget 2,400 a minute), so one round for 50 symbols is 2,500 or 1,000. The client runs at
 most one round a minute, even if the connection keeps dropping and reconnecting. On an
 HTTP 429 (too many requests) or 418 (IP banned for not backing off) it stops asking for the
-rest of that connection, and those books use `depth5` seeding.
+rest of that connection, and those books use `depth5` seeding. I use `limit=1000` and not
+5000 because on spot 5000 costs 250 weight instead of 50, for levels the program never
+writes (it outputs the top 5).
+
+**How many requests at once (`--rest-parallel`).** `bench/rest_parallel_bench.sh` runs the
+program live on spot with 20 symbols and `--rest-snapshot`, with N = 1, 2, 4 and 8 at the
+same time, so all four see the same network. It measures the time from the first market
+data row to the last `rest_snapshot` row. I ran it twice, 83 s apart:
+
+| N | run 1 | run 2 |
+|---|---|---|
+| 1 | 7.226 s | 6.703 s |
+| 2 | 3.336 s | 3.924 s |
+| 4 (default) | 1.849 s | 1.750 s |
+| 8 | 1.105 s | 1.019 s |
+
+Every run got 20/20 snapshots and 0 REST errors. I picked 4 as the default. It is about
+3.9× faster than one at a time. Going from 4 to 8 only saves another ~0.75 s, but it
+doubles the TLS handshakes running on the io thread (the same thread that reads the
+WebSocket) and the requests already in flight when a 429 arrives. The request weight of a
+round is the same for every N.
 
 **What it does not do yet:**
 
@@ -304,6 +352,9 @@ rest of that connection, and those books use `depth5` seeding.
   book thread to signal the network thread.
 - A snapshot that fails (network error, timeout, non-200) or is dropped is not retried
   until the next connect.
+- If a reconnect happens within 60 s of the last round, the round is skipped. Symbols whose
+  request was in flight when the old connection dropped are then not fetched again on the
+  new connection, and their books seed from `depth5`.
 - If DNS stops answering in the middle of a round, a REST lookup can delay shutdown by up
   to ~30 s. A running `getaddrinfo` can't be cancelled.
 
@@ -317,8 +368,52 @@ rest of that connection, and those books use `depth5` seeding.
 | USD-M, `--rest-snapshot` | 53 | 0 | 1 fetched (42 KB), 1 applied |
 
 Both REST captures replayed byte for byte. In a 30-second spot run with BTCUSDT and
-ETHUSDT, the snapshots arrived 0.48 s and 0.77 s after start. Both repairs in that run
-were on ETHUSDT before its snapshot arrived, and there were 0 after.
+ETHUSDT (fetched one after another, before `--rest-parallel` existed), the snapshots
+arrived 0.48 s and 0.77 s after start. Both repairs in that run were on ETHUSDT before its
+snapshot arrived, and there were 0 after.
+
+### Full-depth accuracy against Binance
+
+The `depth5` check only covers the top 5 levels. To check the rest of the book, I compared
+it with Binance's own REST `/depth`.
+
+**Method.** During a 10-minute live capture of BTCUSDT (spot and USD-M, both with
+`--rest-snapshot`), a separate process fetched Binance's REST `/depth` (`limit=1000`) every
+10 s and saved each response. `tests/verify_against_rest.cpp` (CMake target
+`verify_against_rest`) replays the market data file through the same `Processor`. It brings
+each saved snapshot forward with the captured diffs (same sequence rules) until it is at the
+same update id as the book, then compares both sides level by level from the best price,
+over the price range the snapshot covered.
+
+```bash
+cmake --build build --target verify_against_rest
+./build/verify_against_rest MARKET_DATA_CSV SNAPSHOT.json [SNAPSHOT.json ...]
+```
+
+It prints one line per snapshot and a summary.
+
+| | spot | USD-M |
+|---|---|---|
+| snapshots compared | 58 | 45 |
+| exact through the top 100 levels on both sides | 58 | 45 |
+| exact through all ~1000 levels on both sides | 16 | 40 |
+| fewest exact levels in any snapshot | bids 589, asks 959 | bids 589, asks 951 |
+
+Every first mismatch (one per side that was not exact: 43 on spot, 5 on USD-M) was at a
+price outside the range our own startup REST snapshot covered (spot: bids below 65,163.50
+or asks above 65,828.15; USD-M: bids below 65,330.90 or asks above 65,637.20). 0 were
+inside it.
+
+The reason: the book knows exactly the levels in its startup snapshot plus every level a
+diff has touched since. When the price drifts, Binance's 1000-level window includes deeper
+prices that nobody has touched since we started, so we never heard of them. Within every
+price range the book was told about, it matched Binance exactly, in all 103 snapshots.
+
+In the same capture there were 0 gaps and 0 reconnects. The only spot `depth5` repair
+happened 0.197 s after start, before our REST snapshot arrived at 0.298 s.
+
+To check the checker itself, I also gave it a deliberately edited snapshot. It was caught
+(bids matched 1/5).
 
 ## Threading and I/O
 
@@ -344,8 +439,9 @@ were on ETHUSDT before its snapshot arrived, and there were 0 after.
 - **Back-pressure.** If the ring is full, the network thread waits (counted as
   `queue_full_waits`) instead of dropping messages, because a dropped message would make
   the audit file incomplete. Waiting stops reading the socket, so TCP flow control pushes
-  back on Binance. At 4096 slots and ~30 messages/s per symbol the ring holds minutes of
-  data, so in practice this never triggers.
+  back on Binance. At 50 to 200 messages/s per symbol, the 4096 slots are 20 to 80 s of
+  data for one symbol, and about 1 s with 50 busy symbols. The ring only fills if the book
+  thread stalls for that long. `queue_full_waits` stayed 0 in every run.
 - **Buffered writes.** Each file collects rows in a 256 KB in-memory buffer and calls
   `fwrite` once per buffer (stdio buffering is turned off, so data is not copied twice).
   The book thread also flushes every second when idle, so files on disk stay current
@@ -375,6 +471,10 @@ were on ETHUSDT before its snapshot arrived, and there were 0 after.
   `b`, `a`, `m`, ...) and unused ones are skipped. Each payload is parsed once on the book
   thread, from the exact bytes that went into the market data file. That is what makes
   replay identical to live.
+- **Minifying on the network thread.** `payload_json` has to be minified, and Binance
+  payloads are only minified by convention, so the network thread runs `simdjson::minify`
+  while it copies each payload into its slot. It costs about a microsecond, so I kept it on
+  purpose.
 - **Order book side = sorted `std::vector<Level>`, best price at the back.** The top 5
   are the last 5 elements and lookup is a binary search. An insert or erase deep in the
   book shifts the levels above it (O(n) memmove), but it is one contiguous block with no
@@ -389,8 +489,8 @@ were on ETHUSDT before its snapshot arrived, and there were 0 after.
 ## Design choices and measurements
 
 All numbers were measured on the dev machine (WSL2 on an Intel Core Ultra 9 285H, GCC
-11.4, Release build). The benchmark that decided a choice is kept in
-[`bench/`](bench/) so it can be rerun. One-off checks are described with the command
+11.4, Release build). The benchmarks that decided a choice are kept in
+[`bench/`](bench/) so they can be rerun. One-off checks are described with the command
 that repeats them.
 
 ### Where the time goes
@@ -429,9 +529,10 @@ much. What it does change is the tail (p99, max) and the headroom for 50 symbols
 | Clock for latency | `steady_clock` (monotonic) | `system_clock` | The first 10-minute run measured with the wall clock and showed a fake max of 1.6 to 2.0 s. WSL steps its clock when it re-syncs with Windows. Durations need a clock that never jumps. |
 | Prices and sizes | `int64` × 10^8 | `double` | The `depth5` check compares levels for exact equality, and decimals like 0.1 are not exact in binary floating point. |
 | JSON parser | simdjson On-Demand | | In the profile, simdjson's own structure scan is about 3% of replay instructions, so parsing is not where the time goes. |
-| Compiler flags | `-O3` (CMake Release) | `-march=native` | Replay went from 15.8 to 14.9 ms (spot) and 27.1 to 27.3 ms (USD-M): noise. It would also tie the binary to the CPU it was built on. |
+| Compiler flags | `-O3` (CMake Release) | `-march=native` | Wall time of the whole replay process, including start-up, went from 15.8 to 14.9 ms (spot) and 27.1 to 27.3 ms (USD-M): noise. (The ~11 ms in [Performance](#performance) is the time replay prints for itself, without start-up.) It would also tie the binary to the CPU it was built on. |
 | Includes | the specific standard headers | `<bits/stdc++.h>` | Same speed when running, since headers only declare things. A one-line file takes 0.54 s to compile instead of 0.04 s (130k lines pulled in instead of 14k), and `processor.cpp` goes from 2.4 to 3.3 s. It is also GCC-only. |
 | Seeding the book | first `depth5` by default, REST `/depth` with `--rest-snapshot` | | Both keep replay exact (see [REST snapshot](#rest-snapshot---rest-snapshot)). Same 5 minutes of spot: 15 repairs with `depth5` seeding, 0 with the REST snapshot. REST stays optional because it adds an HTTPS dependency and request weight, and `depth5` seeding already self-repairs. Without REST: The cost, measured over 10 minutes of spot: 48 repairs in 6,296 checks (0.8%), 14 in the first minute and 22 during one fast move in minutes 5 and 6, while the deep levels were still unknown. |
+| REST requests at once | 4 (`--rest-parallel`, 1 to 8) | 1 (one after another), 8 | `bench/rest_parallel_bench.sh`, live spot, 20 symbols, time until the last snapshot: 6.703 to 7.226 s one at a time, 1.750 to 1.849 s with 4 (about 3.9× faster), 1.019 to 1.105 s with 8. Going from 4 to 8 only saves ~0.75 s, but doubles the TLS handshakes running on the io thread that also reads the WebSocket, and the requests in flight when a 429 arrives. Request weight per round is the same for every N. See [REST snapshot](#rest-snapshot---rest-snapshot). |
 
 ### Profile
 
@@ -450,7 +551,7 @@ The biggest item that live mode also pays for is the book's memmove, and live it
 still only tens of microseconds at p99 per depth diff (see the table above), well under
 the feed's 100 ms batching.
 
-### Running the benchmark
+### Running the benchmarks
 
 ```bash
 cmake --build build --target wait_bench
@@ -464,6 +565,17 @@ sleep    p50    225.1 us   p99    659.8 us   max    743.6 us   cpu   5.7% of one
 spin     p50      0.9 us   p99    158.2 us   max    423.7 us   cpu 106.6% of one core
 condvar  p50    245.8 us   p99    497.8 us   max    832.5 us   cpu   1.4% of one core
 ```
+
+```bash
+bench/rest_parallel_bench.sh [path/to/binance_capture]   # default ./build/binance_capture
+```
+
+`rest_parallel_bench.sh` runs live against Binance for 40 s: four copies of the program at
+the same time (spot, 20 symbols, `--rest-snapshot`, `--rest-parallel` 1, 2, 4 and 8). It
+prints one line per N with the snapshots that arrived, the time from the first market data
+row to the last snapshot, and the REST errors in the log. One run of the script costs
+~4,000 request weight of the 6,000 a minute per IP, so wait at least 70 s before running it
+again. The results are in [REST snapshot](#rest-snapshot---rest-snapshot).
 
 ## Metrics
 
@@ -518,8 +630,11 @@ of a take-home:
 
 ## Limits and safety
 
-- 1 to 50 symbols, uppercase letters and digits only, no duplicates. The stream URL is
-  capped at 4096 characters.
+- 1 to 50 symbols, no duplicates. The input is uppercased first, then each symbol must be
+  letters and digits only. The stream URL is capped at 4096 characters.
+- Bad options are rejected with the usage text, for example a non-numeric `--duration` or a
+  `--rest-parallel` outside 1 to 8.
+- A short `fwrite` or a failed `fclose` counts as a write error (`write_errors`).
 - WebSocket messages are capped at 1 MB (`read_message_max`). A larger message is an error
   and triggers a reconnect, not unbounded memory use.
 - No API keys or secrets are used or stored. Only public market data endpoints.
@@ -535,6 +650,9 @@ Spot and USD-M ran at the same time:
 ./build/binance_capture --venue usdm --symbols BTCUSDT --output-dir ./output --duration 120
 ```
 
+Both ran with `--duration 120`, but the files span ~128 s of Binance time: the WSL VM clock
+ran slow, so the 120 s timer took longer in real time.
+
 The full files are in [`sample/`](sample/):
 
 | File | Rows |
@@ -542,7 +660,12 @@ The full files are in [`sample/`](sample/):
 | `market_data_spot_BTCUSDT_2026-11-14.csv` | 5,967 (1,260 depth_diff, 1,260 depth5, 3,447 trade) |
 | `market_data_spot_BTCUSDT_2026-11-14_orderbook.csv` | 4,709 (1,259 D, 3 S, 3,447 T) |
 | `market_data_usdm_BTCUSDT_2026-11-14.csv` | 5,788 (1,248 depth_diff, 1,214 depth5, 3,326 trade) |
-| `market_data_usdm_BTCUSDT_2026-11-14_orderbook.csv` | 4,575 (1,248 D, 1 S, 3,326 T) |
+| `market_data_usdm_BTCUSDT_2026-11-14_orderbook.csv` | 5,470 (1,248 D, 896 S, 3,326 T) |
+
+The two order book files were regenerated from the two market data files by replay, after
+the change that gives every applied `depth5` its own `S` row. The spot file came out
+byte-identical. On USD-M the only difference is the added `S` rows (one per folded
+snapshot) and the `seqNo` shift that comes with them.
 
 Final counters:
 
@@ -557,10 +680,15 @@ usdm [final] messages=5788 md_rows=5788 ob_rows=4575 parse_errors=0 unknown_stre
      queue_full_waits=0 write_errors=0
 ```
 
+These counters come from the build that captured the sample. Newer builds also print the
+`rest_*` counters (all 0 without `--rest-snapshot`). The `S`-row change does not change any
+counter apart from `ob_rows`, which is 5470 for USD-M now, matching the file above.
+
 - **Spot:** each of the 1,259 applied diffs was matched by a `depth5` with the same update
   id, and the top 5 levels were compared exactly. 2 differed, right after start (see
   [above](#order-book-sequencing-and-reconnects)), and were repaired. 0 differed after that.
-- **USD-M:** 318 exact comparisons with 0 mismatches, and 895 snapshots folded in.
+- **USD-M:** 318 exact comparisons with 0 mismatches, and 895 snapshots folded in (each
+  with its own `S` row).
 - **Both:** no gaps, resets, reconnects or parse errors. The one stale diff on spot is the
   diff that arrived right after the seeding snapshot with the same id, as expected.
 
@@ -595,12 +723,20 @@ cmp sample/market_data_usdm_BTCUSDT_2026-11-14_orderbook.csv replay_output/marke
 # no output from cmp = identical
 ```
 
+The spot order book file in `sample/` is byte-identical to the live one. The USD-M one was
+itself written by replay (see [above](#sample-run)), so for USD-M this shows that replay
+gives the same file every time. The live-vs-replay checks are in
+[Checks I ran](#checks-i-ran).
+
 ### Performance
 
-- Replaying the spot sample (5,967 messages) takes about 11 ms end to end on one thread:
-  CSV read, JSON parse, book update and CSV write. That is roughly 540k messages/s, or
-  about 1.8 µs per message, with a peak RSS of 6.4 MB. The USD-M sample takes about 22 ms,
-  because its diffs carry more levels.
+- Replaying the spot sample (5,967 messages) takes about 11 ms on one thread: CSV read,
+  JSON parse, book update and CSV write. That is roughly 540k messages/s, or about 1.8 µs
+  per message, with a peak RSS of 6.4 MB. The USD-M sample takes about 22 ms, because its
+  diffs carry more levels. These are the times replay prints for itself (the
+  `[replay] ... in X s` line), without process start-up. The `-march=native` row in
+  [Choices](#choices) measured the wall time of the whole process instead, which is why its
+  numbers are higher.
 - Live, the rate was 50 to 200 messages/s per symbol (more in a busy market, mostly
   trades), so the book thread is idle more than 99% of the time. The limit is the feed,
   not the CPU. `queue_full_waits` stayed 0 in every run.
@@ -612,11 +748,12 @@ cmp sample/market_data_usdm_BTCUSDT_2026-11-14_orderbook.csv replay_output/marke
 
 | Check | Result |
 |---|---|
-| Release build, `-Wall -Wextra -Wpedantic -Wshadow -Wconversion` | no warnings |
+| Release build, `-Wall -Wextra -Wpedantic -Wshadow -Wconversion -Wno-sign-conversion` | no warnings |
 | Unit tests (decimal parser, CSV escaping, book side incl. `replace_top` on both sides, latency percentiles, spot and USD-M sync, gaps, resets, depth5 check/repair/fold, REST snapshot behind/ahead/too old/after reconnect/after a gap/USD-M, replay equals live) | pass |
 | `--rest-snapshot`: ASan + UBSan and TSan builds, unit tests and 20 s live spot and USD-M captures of BTCUSDT and ETHUSDT | clean, no races |
 | `--rest-snapshot` live A/B, 5 minutes, spot and USD-M (table in [REST snapshot](#rest-snapshot---rest-snapshot)) | spot repairs 15 → 0; replays byte-identical |
-| Without `--rest-snapshot`: replay of both samples vs the files from the build without REST support | byte-identical |
+| Without `--rest-snapshot`: replay of both samples vs the files from the build without REST support (done before the `S`-row change) | byte-identical |
+| Full-depth accuracy: `verify_against_rest` on a 10-minute live capture of BTCUSDT, spot and USD-M, against 103 REST `/depth` snapshots saved every 10 s by another process (see [Full-depth accuracy](#full-depth-accuracy-against-binance)) | top 100 levels exact in all 103; exact within every price range the book was told about; a deliberately edited snapshot was caught |
 | Independent review of the REST code (sync rules, and threads/lifetime/shutdown) | 7 findings, all fixed or documented above |
 | ASan + UBSan build: unit tests, replay of both samples, 20 s live USD-M capture of BTCUSDT and ETHUSDT with `--busy-poll` | clean, no leaks |
 | TSan build: unit tests, 20 s live spot capture of BTCUSDT and ETHUSDT, once default and once with `--busy-poll` (network thread and book thread both busy) | no data races |
@@ -629,8 +766,8 @@ cmp sample/market_data_usdm_BTCUSDT_2026-11-14_orderbook.csv replay_output/marke
 On recent kernels, GCC 11's TSan needs ASLR off to start ("unexpected memory mapping"),
 so run it as `setarch $(uname -m) -R ./build-tsan/binance_capture ...`.
 
-The reconnect path (backoff, `conn_epoch` increment, book reset on a new epoch) is covered
-by unit tests of the epoch logic. No disconnect happened during the sample runs.
+The book reset on a new `conn_epoch` is unit tested. `WsClient`'s backoff and the
+`conn_epoch` increment are not, and no disconnect happened in the live runs.
 
 ## How to Submit on GitHub
 
@@ -647,8 +784,8 @@ git push -u origin main
 
 ### 2. `.gitignore` excludes build artifacts and secrets
 
-`build/`, `output/`, `replay_output/` and `*.csv` are ignored, except the small sample files
-in `sample/`. No credentials are needed.
+`build/`, `output/`, `replay_output/` and `*.csv` are ignored, except the sample files in
+`sample/` (about 9 MB in total). No credentials are needed.
 
 ### 3. Tag your submission
 
@@ -662,8 +799,14 @@ git push origin v1.0.0
 | Step | Command |
 |---|---|
 | Build from clean | `cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build` |
-| Unit tests | `ctest --test-dir build --output-on-failure` |
-| Live 300 s capture | `./build/binance_capture --venue spot --symbols BTCUSDT --duration 300` |
-| Column count check | `awk -F',' 'NR==2{print NF}' output/*_orderbook.csv` gives `26` |
-| Replay matches live | `./build/binance_capture --replay output/market_data_spot_BTCUSDT_<date>.csv --output-dir replay_output && cmp output/*_orderbook.csv replay_output/*_orderbook.csv` |
-| No secrets in repo | `git grep -i "api_key\|secret\|password"` only matches the `config/secrets.json` ignore rule and this README |
+| Unit tests | `(cd build && ctest --output-on-failure)` or `./build/tests/unit_tests` |
+| Live 300 s capture | `./build/binance_capture --venue spot --symbols BTCUSDT --duration 300` (writes to `./output`) |
+| Market data file starts right | `head -2 output/market_data_spot_BTCUSDT_<date>.csv` shows the header and the first row |
+| Order book file starts right | `head -2 output/market_data_spot_BTCUSDT_<date>_orderbook.csv` shows the exact header and the first row |
+| Column count check | `awk -F',' 'NF!=26{n++} END{print n+0}' output/market_data_spot_BTCUSDT_<date>_orderbook.csv` gives `0` (every row has 26 columns) |
+| Replay matches live | `./build/binance_capture --replay output/market_data_spot_BTCUSDT_<date>.csv --output-dir replay_output && cmp output/market_data_spot_BTCUSDT_<date>_orderbook.csv replay_output/market_data_spot_BTCUSDT_<date>_orderbook.csv` (no output = identical) |
+| No secrets in repo | `git grep -i -e api_key -e secret -e password` only matches the `config/secrets.json` ignore rule and this README |
+
+`<date>` is the UTC date the run started, e.g. `2026-11-14`. If `output/` already had a spot
+BTCUSDT capture from that day, the new files are `..._<date>_2.csv` and
+`..._<date>_2_orderbook.csv` (see [Output files](#output-files)).
