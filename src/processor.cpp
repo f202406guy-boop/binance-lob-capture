@@ -147,6 +147,9 @@ void Processor::apply_diff(SymbolState& s, RawMessage& msg) {
         s.check_pending = false;
         bump(metrics_.depth5_folded);
         bump(metrics_.depth5_applied);
+        // Every applied depth5 gets its own row. Its top 5 are exactly what
+        // Binance published at the snapshot's id; the D row for the diff follows.
+        write_book_row(s, msg, 'S', 'N');
     }
 
     for (const Level& lv : depth_.bids) s.bids.set(lv.price, lv.qty);
