@@ -427,39 +427,81 @@ To check the checker itself, I also gave it a deliberately edited snapshot. It w
  publish slot                        4096 slots   write order book row   -> buffer -> file
 ```
 
-- **Two threads, one lock-free single-producer/single-consumer ring.** The network thread
-  never touches the disk, so a slow write can never stall the socket read. The ring uses one
-  atomic head and one atomic tail with acquire/release ordering, on separate cache lines.
-  Each side keeps a cached copy of the other side's index, so it rarely touches the shared
-  line. There are no mutexes or condition variables on the per-message path.
-- **No per-message allocation in steady state.** Slots are reused in place, and the
-  `std::string` in each slot keeps its capacity. The book thread reuses its row buffer, the
-  level vectors and one simdjson parser. The network thread reuses its frame buffer and
-  parser.
-- **Back-pressure.** If the ring is full, the network thread waits (counted as
-  `queue_full_waits`) instead of dropping messages, because a dropped message would make
-  the audit file incomplete. Waiting stops reading the socket, so TCP flow control pushes
-  back on Binance. At 50 to 200 messages/s per symbol, the 4096 slots are 20 to 80 s of
-  data for one symbol, and about 1 s with 50 busy symbols. The ring only fills if the book
-  thread stalls for that long. `queue_full_waits` stayed 0 in every run.
-- **Buffered writes.** Each file collects rows in a 256 KB in-memory buffer and calls
-  `fwrite` once per buffer (stdio buffering is turned off, so data is not copied twice).
-  The book thread also flushes every second when idle, so files on disk stay current
-  during a live run. An idle book thread yields, then sleeps 200 µs, so it does not burn a
-  core when the market is quiet. `--busy-poll` makes it spin instead.
-- **Shutdown.** SIGINT/SIGTERM (or `--duration`) is handled with `asio::signal_set`, so the
-  handler runs on the io thread, not in signal context. It stops the timers, sends a
-  WebSocket close (forcing the socket closed after 2 s at most), and `io_context::run()`
-  returns. The book thread drains whatever is left in the ring, then files are flushed and
-  closed and final counters are printed. Every timer handler also checks a `stopping`
-  flag, because a timer that has already expired can't be cancelled (its handler still
-  runs, with no error). Without the flag, a stats timer firing in the same instant as the
-  `--duration` timer re-armed itself and kept `run()` alive forever. After the first
-  signal, SIGINT/SIGTERM get their default action back, so a second Ctrl+C always kills
-  the process. All resources are RAII (`BufferedFile` owns its
-  `FILE*`, the socket lives in a `std::optional` recreated per connection). Async handlers
-  capture `this` plus the connection epoch, and the client outlives `run()`. A late handler
-  from an old connection sees a different epoch and returns without touching anything.
+**Why two threads.** The one thing I didn't want was the socket waiting on the disk. If a
+single thread read a frame, updated the book and wrote two CSV rows, then any slow write
+(the OS flushing its page cache, a busy disk, an antivirus scan on Windows) would stop the
+socket from being read, and Binance's messages would pile up in the kernel. So the program
+has exactly two threads with one job each. The **network thread** runs the Boost.Asio
+`io_context`: it reads WebSocket frames, stamps the receive time, strips the
+`{"stream":...,"data":...}` envelope and hands the payload over. It never touches a file.
+The **book thread** takes messages in order, writes the market data row, parses the JSON,
+updates the book and writes the order book row. It never touches the socket. Everything
+network-related (reconnects, timers, signals, the REST snapshot requests) lives on the
+network thread, so none of it needs locking either.
+
+**How they talk: a lock-free single-producer/single-consumer ring.** Between them sits a
+ring of 4096 `RawMessage` slots (`src/spsc_queue.h`). With exactly one writer and one
+reader, it only needs two atomic counters: `head` (moved by the network thread) and
+`tail` (moved by the book thread). The writer fills a slot and then publishes it with a
+release store on `head`. The reader loads `head` with acquire, so it is guaranteed to see
+the fully written slot. That pair is the only synchronisation on the per-message path:
+no mutex, no condition variable. `head` and `tail` sit on separate 64-byte cache lines so
+the two cores don't keep stealing the same line from each other, and each side keeps a
+cached copy of the other side's counter, so it only reads the shared atomic when it looks
+full or empty. ThreadSanitizer runs (live, both waiting modes) report no data races.
+
+**No allocation per message.** The slots are created once and reused, and the
+`std::string` inside each slot keeps its capacity, so after the first few seconds copying
+a payload in is just a `memcpy`. The book thread reuses one row buffer, its level vectors
+and one simdjson parser, and the network thread reuses its frame buffer and parser. The
+one exception is the ~64 KB REST snapshot, whose slot memory is freed right after use so a
+few big messages don't keep slots large forever.
+
+**Back-pressure.** If the book thread ever fell behind and the ring filled up, I had two
+options: drop messages, or wait. Dropping would leave holes in the audit file, which is the
+one thing that file must not have, so the network thread waits (counted as
+`queue_full_waits`). While it waits it isn't reading the socket, so TCP flow control slows
+Binance down instead of anything being lost. At 50 to 200 messages a second per symbol,
+4096 slots hold 20 to 80 seconds of data for one symbol, and about a second with 50 busy
+symbols. `queue_full_waits` stayed 0 in every run.
+
+**Writing files: buffered writes, not a third writer thread.** Each CSV file collects rows
+in its own 256 KB `std::string` and calls `fwrite` once per full buffer. I turned stdio's
+own buffering off (`setvbuf(..., _IONBF)`) so each byte isn't copied twice. Formatting a
+row is a few `std::to_chars` calls into a reused buffer, well under a microsecond. I
+thought about a dedicated writer thread, but it would mean a second queue and a second
+hand-off for every row, while the only cost it would remove is the occasional 256 KB
+`fwrite`, which shows up in the latency `max` and not in the median. Since the network
+thread is already protected from the disk by the ring, I kept it to two threads. If I had
+to cut the tail further, that writer thread (or `io_uring`) is the next step. The book
+thread also flushes every second when it's idle, so the files on disk stay current during
+a live run.
+
+**When there's nothing to do.** An idle book thread yields 64 times and then sleeps
+200 µs, so it uses almost no CPU in a quiet market. The cost is that a message can wait up
+to a couple of hundred microseconds before it's picked up (measured p50 about 140 µs).
+`--busy-poll` makes it spin instead, which brings that to about 1 µs at the price of one
+full core. I measured a condition variable too, and it was no better than sleeping inside
+WSL (see `bench/wait_bench.cpp`).
+
+**Shutdown.** Ctrl+C, SIGTERM or `--duration` all go through `asio::signal_set` or a timer,
+so the handler runs as a normal callback on the network thread, not inside a signal
+handler. It stops the timers, sends a polite WebSocket close (and force-closes the socket
+after 2 s at most), and `io_context::run()` returns. Then the book thread drains whatever
+is still in the ring, both files are flushed and closed, and the final counters are
+printed, so every message that was received ends up in the file. One bug I found here:
+a timer that has already expired can't be cancelled any more, its handler still runs. A
+stats timer firing in the same instant as the `--duration` timer re-armed itself and kept
+`run()` alive forever (an ASan run hung on it). Now every handler checks a `stopping` flag,
+and after the first signal SIGINT/SIGTERM get their default action back, so a second
+Ctrl+C always kills the process.
+
+**Lifetimes.** Everything that owns something is RAII: `BufferedFile` owns its `FILE*`,
+the WebSocket lives in a `std::optional` that is recreated for each connection, and the
+client object outlives `run()`. Async handlers capture `this` plus the connection's epoch
+number, so a late callback from an old connection sees a different epoch and returns
+without touching anything. ASan + UBSan runs, including live captures with the REST
+snapshot on, came out clean.
 
 ### Why these choices
 
