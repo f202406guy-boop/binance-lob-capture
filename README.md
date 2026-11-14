@@ -57,6 +57,9 @@ cmake -B build-tsan -G Ninja -DCMAKE_BUILD_TYPE=Debug -DENABLE_TSAN=ON   # Threa
 # lowest latency: the book thread spins instead of sleeping (uses one full core)
 ./build/binance_capture --venue spot --symbols BTCUSDT --busy-poll
 
+# full-depth book: also fetch the REST /depth snapshot after every connect
+./build/binance_capture --venue spot --symbols BTCUSDT --rest-snapshot
+
 # replay: rebuild the order book CSV from a market data CSV, no network
 ./build/binance_capture --replay ./output/market_data_spot_BTCUSDT_2026-11-14.csv --output-dir ./replay_output
 
@@ -71,6 +74,7 @@ ctest --test-dir build --output-on-failure      # or ./build/unit_tests
 | `--output-dir` | where CSVs go (default `./output`, created if missing) |
 | `--duration` | seconds to run, `0` or omitted = until SIGINT/SIGTERM |
 | `--busy-poll` | the book thread never sleeps while waiting for messages: about 1 µs wait instead of ~150 µs, at the cost of one core at 100% (see [Design choices](#design-choices-and-measurements)) |
+| `--rest-snapshot` | after every connect, fetch each symbol's REST `/depth` snapshot (1000 levels a side) and merge it into the book, see [REST snapshot](#rest-snapshot---rest-snapshot). Off by default |
 | `--replay` | one or more market data CSVs (comma separated) |
 
 For each symbol the program subscribes to `<symbol>@depth@100ms`, `<symbol>@depth5@100ms`
@@ -87,6 +91,7 @@ and `<symbol>@trade` on one combined-stream connection.
 | `src/spsc_queue.h` | lock-free single-producer single-consumer ring between the two threads |
 | `src/metrics.h`, `src/latency.h` | counters and the latency histogram |
 | `src/ws_client.h/.cpp` | network thread: TLS + WebSocket, reconnect with backoff, receive timestamp, push to the ring |
+| `src/rest_client.h/.cpp` | async HTTPS GET on the same thread, for the optional REST depth snapshot |
 | `src/processor.h/.cpp` | book thread: JSON → sequence checks → book → CSV rows (live and replay both use it) |
 | `src/replay.h/.cpp` | reads a market data CSV back into `RawMessage`s for the processor |
 | `src/main.cpp` | options, threads, signals, periodic stats |
@@ -121,7 +126,7 @@ newline is wrapped in quotes and inner quotes are doubled), header in the first 
 |---|---|
 | `recv_tsec`, `recv_tnsec` | receive time, see [Timestamps](#timestamps) |
 | `venue` | `spot` or `usdm` |
-| `stream_kind` | `depth_diff`, `depth5` or `trade` |
+| `stream_kind` | `depth_diff`, `depth5` or `trade`, plus `rest_snapshot` (the REST `/depth` response) with `--rest-snapshot` |
 | `shard_id` | always `0` (one connection) |
 | `conn_epoch` | starts at 0, +1 on every reconnect attempt |
 | `conn_seq` | 0, 1, 2, ... per connection, across all symbols on it, so it is monotonic within `(shard_id, conn_epoch)` |
@@ -202,7 +207,7 @@ With `last` = the update id the book is at:
 
 | Condition | Action |
 |---|---|
-| book not valid yet | drop (counted as `diffs_waiting`), no row |
+| book not valid yet | not applied (`diffs_waiting`), no row. It is still kept for a REST snapshot, so it gets parsed, and a malformed one counts as a parse error |
 | `u <= last` | already in the book, drop (`diffs_stale`), no row |
 | previous id `> last` | updates are missing: **reset** the book, write an `R` row, wait for the next `depth5` (`gaps`) |
 | otherwise | apply all levels, `last = u`, write a `D` row |
@@ -247,36 +252,73 @@ valid, it resets the book (`R` row) because updates may have been missed while
 disconnected. It then waits for the next `depth5`, normally within 100 ms. Because the
 reset is driven by the `conn_epoch` column, replay makes exactly the same decision.
 
-**Why no REST snapshot.** The optional stretch goal (REST `/depth` snapshot plus buffered
-diffs) would give a full-depth book from the first second. I left it out on purpose. The
-REST response is not one of the three streams, so it would not be in the market data CSV,
-and replay could no longer rebuild the same book from that file alone. With `depth5`
-seeding, the audit file stays the single source of truth.
+**Without a REST snapshot (the default),** right after a seed the book only knows the top 5
+levels plus whatever diffs touch afterwards. If the price moves through the seeded levels
+before the deeper ones have been touched, a level can be missing. The `depth5` check
+catches exactly this and repairs it. In the sample spot run, the only 2 mismatches
+happened 2 s and 6 s after start, followed by 0 in the remaining ~115 s. Over a 10-minute
+spot run there were 48 repairs in 6,296 checks (0.8%). Most were bunched at the start (14
+in the first minute) and during one fast move (22 in minutes 5 and 6). The other minutes
+had 0 to 4.
 
-The cost is that right after a seed, the book only knows the top 5 levels plus whatever
-diffs touch afterwards. If the price moves through the seeded levels before the deeper
-ones have been touched, a level can be missing. The `depth5` check catches exactly this
-and repairs it. In the sample spot run, the only 2 mismatches happened 2 s and 6 s after
-start, followed by 0 in the remaining ~115 s. Over a 10-minute spot run there were 48
-repairs in 6,296 checks (0.8%). Most were bunched at the start (14 in the first minute)
-and during one fast move (22 in minutes 5 and 6). The other minutes had 0 to 4.
+### REST snapshot (`--rest-snapshot`)
 
-**How I would add the REST snapshot without breaking replay:**
+The optional stretch goal: a full-depth book from the first second. The catch is replay.
+The REST response is not one of the three streams, so if it only lived in memory, replay
+could no longer rebuild the same book from the market data file alone. So the response
+goes into the market data file as its own row type:
 
-1. After each connect, the network thread fetches `GET /api/v3/depth?symbol=X&limit=1000`
-   (spot) or `/fapi/v1/depth` (USD-M) over HTTPS, without blocking the socket read.
-2. It pushes the response into the same queue as a new `stream_kind`, `rest_snapshot`, so
-   it lands in the market data CSV in the order it arrived. Replay then sees exactly what
-   live saw.
-3. Until the snapshot arrives, the book thread buffers diffs instead of dropping them.
-   When it arrives: drop buffered diffs with `u <= lastUpdateId`, check that the first one
-   left spans `lastUpdateId + 1` (spot) or `lastUpdateId` (USD-M), then apply the rest.
-4. After a gap the book thread needs a new snapshot, so it has to signal the network
-   thread (an atomic flag per symbol that a timer checks).
-5. Request weight: `limit=1000` costs 50 on spot against a budget of 6,000 per minute,
-   so 50 symbols fit, but a reconnect storm would have to be spread out.
+1. After every WebSocket connect, the network thread fetches
+   `GET /api/v3/depth?symbol=X&limit=1000` (spot) or `/fapi/v1/depth?...&limit=1000`
+   (USD-M) for each symbol, one after another. The request is async on the same
+   `io_context`, so the socket read is never blocked, and TLS peer and hostname
+   verification are on like for the WebSocket.
+2. The response is pushed into the same queue as `stream_kind = rest_snapshot`, so it lands
+   in the market data CSV in the order it arrived. Replay sees exactly what live saw and
+   needs no flag.
+3. The book thread always keeps the last 30 diffs per symbol (3 s). A snapshot has its own
+   update id `L`, usually a little behind or ahead of the live book. The book thread
+   builds a separate full-depth book from it, then brings that book forward with the kept
+   diffs (and then the incoming ones), using the same sequence rules as the live book:
+   skip `u <= L`, and if a diff's previous id is past the REST book's id, a diff is
+   missing and the snapshot is dropped (`rest_dropped`).
+4. As soon as the REST book and the live book are at the same update id, the REST book is
+   swapped in and an `S` row is written (`rest_applied`). If the book was not valid (start,
+   or after a reset), it is swapped in right away. Before swapping, the two top 5 are
+   compared (`rest_top_mismatch`): a difference means the live book was missing a level.
+5. `depth5` keeps doing the checking and repairing exactly as before.
 
-`depth5` would still do the checking and repairing.
+Without `--rest-snapshot` there are no `rest_snapshot` rows, and the order book output is
+byte for byte the same as before.
+
+**Request weight.** `limit=1000` costs 50 on spot (budget 6,000 a minute) and 20 on USD-M
+(budget 2,400 a minute), so one round for 50 symbols is 2,500 or 1,000. The client runs at
+most one round a minute, even if the connection keeps dropping and reconnecting. On an
+HTTP 429 (too many requests) or 418 (IP banned for not backing off) it stops asking for the
+rest of that connection, and those books use `depth5` seeding.
+
+**What it does not do yet:**
+
+- After a sequence gap, a pending REST book that is still continuous takes over. Otherwise
+  the book reseeds from `depth5`. Fetching a fresh snapshot after a gap would need the
+  book thread to signal the network thread.
+- A snapshot that fails (network error, timeout, non-200) or is dropped is not retried
+  until the next connect.
+- If DNS stops answering in the middle of a round, a REST lookup can delay shutdown by up
+  to ~30 s. A running `getaddrinfo` can't be cancelled.
+
+**Measured.** Spot and USD-M BTCUSDT for the same 5 minutes, with and without the flag:
+
+| | `depth5` checks | mismatches (missing levels, repaired) | REST |
+|---|---|---|---|
+| spot, `depth5` seeding only | 3,097 | **15** | |
+| spot, `--rest-snapshot` | 3,096 | **0** | 1 fetched (64 KB), 1 applied, top 5 agreed at the swap |
+| USD-M, `depth5` seeding only | 53 | 0 | |
+| USD-M, `--rest-snapshot` | 53 | 0 | 1 fetched (42 KB), 1 applied |
+
+Both REST captures replayed byte for byte. In a 30-second spot run with BTCUSDT and
+ETHUSDT, the snapshots arrived 0.48 s and 0.77 s after start. Both repairs in that run
+were on ETHUSDT before its snapshot arrived, and there were 0 after.
 
 ## Threading and I/O
 
@@ -389,7 +431,7 @@ much. What it does change is the tail (p99, max) and the headroom for 50 symbols
 | JSON parser | simdjson On-Demand | | In the profile, simdjson's own structure scan is about 3% of replay instructions, so parsing is not where the time goes. |
 | Compiler flags | `-O3` (CMake Release) | `-march=native` | Replay went from 15.8 to 14.9 ms (spot) and 27.1 to 27.3 ms (USD-M): noise. It would also tie the binary to the CPU it was built on. |
 | Includes | the specific standard headers | `<bits/stdc++.h>` | Same speed when running, since headers only declare things. A one-line file takes 0.54 s to compile instead of 0.04 s (130k lines pulled in instead of 14k), and `processor.cpp` goes from 2.4 to 3.3 s. It is also GCC-only. |
-| Seeding the book | first `depth5` | REST `/depth` snapshot | Keeps replay exact (see [Why no REST snapshot](#order-book-sequencing-and-reconnects)). The cost, measured over 10 minutes of spot: 48 repairs in 6,296 checks (0.8%), 14 in the first minute and 22 during one fast move in minutes 5 and 6, while the deep levels were still unknown. |
+| Seeding the book | first `depth5` by default, REST `/depth` with `--rest-snapshot` | | Both keep replay exact (see [REST snapshot](#rest-snapshot---rest-snapshot)). Same 5 minutes of spot: 15 repairs with `depth5` seeding, 0 with the REST snapshot. REST stays optional because it adds an HTTPS dependency and request weight, and `depth5` seeding already self-repairs. Without REST: The cost, measured over 10 minutes of spot: 48 repairs in 6,296 checks (0.8%), 14 in the first minute and 22 during one fast move in minutes 5 and 6, while the deep levels were still unknown. |
 
 ### Profile
 
@@ -429,7 +471,8 @@ Printed to stderr every 10 s and at exit:
 
 `messages, md_rows, ob_rows, parse_errors, unknown_streams, reconnects, diffs_applied,
 diffs_stale, diffs_waiting, gaps, book_resets, depth5_applied, depth5_stale, depth5_checked,
-depth5_mismatch, depth5_folded, trades, queue_full_waits, write_errors`
+depth5_mismatch, depth5_folded, trades, rest_snapshots, rest_applied, rest_dropped,
+rest_top_mismatch, queue_full_waits, write_errors`
 
 In live mode the book thread also prints latency every 10 s and at exit:
 
@@ -570,7 +613,11 @@ cmp sample/market_data_usdm_BTCUSDT_2026-11-14_orderbook.csv replay_output/marke
 | Check | Result |
 |---|---|
 | Release build, `-Wall -Wextra -Wpedantic -Wshadow -Wconversion` | no warnings |
-| Unit tests (decimal parser, CSV escaping, book side incl. `replace_top` on both sides, latency percentiles, spot and USD-M sync, gaps, resets, depth5 check/repair/fold, replay equals live) | pass |
+| Unit tests (decimal parser, CSV escaping, book side incl. `replace_top` on both sides, latency percentiles, spot and USD-M sync, gaps, resets, depth5 check/repair/fold, REST snapshot behind/ahead/too old/after reconnect/after a gap/USD-M, replay equals live) | pass |
+| `--rest-snapshot`: ASan + UBSan and TSan builds, unit tests and 20 s live spot and USD-M captures of BTCUSDT and ETHUSDT | clean, no races |
+| `--rest-snapshot` live A/B, 5 minutes, spot and USD-M (table in [REST snapshot](#rest-snapshot---rest-snapshot)) | spot repairs 15 → 0; replays byte-identical |
+| Without `--rest-snapshot`: replay of both samples vs the files from the build without REST support | byte-identical |
+| Independent review of the REST code (sync rules, and threads/lifetime/shutdown) | 7 findings, all fixed or documented above |
 | ASan + UBSan build: unit tests, replay of both samples, 20 s live USD-M capture of BTCUSDT and ETHUSDT with `--busy-poll` | clean, no leaks |
 | TSan build: unit tests, 20 s live spot capture of BTCUSDT and ETHUSDT, once default and once with `--busy-poll` (network thread and book thread both busy) | no data races |
 | SIGINT during a live capture | clean stop; every received message written; files end on a complete line |
