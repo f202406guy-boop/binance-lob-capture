@@ -1,3 +1,31 @@
+// This file has main(). It reads the options, opens the output files, starts the two
+// threads, prints stats every 10 s and handles stopping. Replay mode skips the network part
+// and just runs each market data CSV through replay_file().
+// Symbols are uppercased first and then have to be 2 to 20 letters and digits, 1 to 50 of
+// them, no duplicates, and the stream URL can't go over 4096 characters. --duration has to
+// be a whole number >= 0 and --rest-parallel goes from 1 to 8 (default 4). If an output name
+// is taken I add _2, _3, ..., so an old capture never gets overwritten.
+// Live mode uses two threads. The main thread runs the io_context (the WebSocket, plus the
+// REST requests with --rest-snapshot) and the book thread runs run_consumer(). They pass
+// messages through the lock-free SPSC ring, so a slow disk write never holds up the socket.
+// When the ring is empty the book thread yields 64 times and then sleeps 200 us, which keeps
+// the CPU near zero but means a message can wait a few hundred us. --busy-poll keeps checking
+// instead: the wait drops to about 1 us, but one core sits at 100%, so it's an option and
+// not the default. I picked this with bench/wait_bench.cpp. A condition variable used less
+// CPU but wasn't faster than sleeping, because waking a thread is slow inside the WSL VM.
+// wait_us and work_us are measured with steady_clock. My first runs used the wall clock and
+// showed a fake max of 1.6 to 2.0 s, which was just WSL stepping its clock. When idle the
+// book thread flushes the files every second and prints latency every 10 s. A REST snapshot
+// is ~64 KB and a slot's string never gives memory back on its own, so I free it right away.
+// For shutdown I use asio's signal_set, so the handler runs on the io thread and not inside
+// a real signal handler. Every timer handler also checks the stopping flag, because a timer
+// that has already expired can't be cancelled and its handler still runs with no error.
+// Before I added it, a stats timer firing at the same moment as the --duration timer
+// re-armed itself and run() never returned (an ASan run caught that). signals.clear() gives
+// SIGINT/SIGTERM their default action back, so a second Ctrl+C always kills the process.
+// After run() returns I set producer_done, the book thread drains the ring, and then the
+// files are closed and the final counters and latency are printed. There are no unit tests
+// for this file. I checked stopping by hand with Ctrl+C and with --duration 10, 20 and 30.
 #include <atomic>
 #include <cctype>
 #include <chrono>
@@ -148,7 +176,6 @@ std::string utc_date() {
     return buf;
 }
 
-// Never overwrite an earlier capture: add _2, _3, ... if the name is taken.
 std::string free_base_name(const fs::path& dir, const std::string& base) {
     std::string name = base;
     for (int n = 2; fs::exists(dir / (name + ".csv")) || fs::exists(dir / (name + "_orderbook.csv")); ++n)
@@ -156,10 +183,6 @@ std::string free_base_name(const fs::path& dir, const std::string& base) {
     return (dir / name).string();
 }
 
-// The book thread. By default it yields a few times and then sleeps 200 us
-// when the queue is empty, which keeps CPU near zero but means a message can
-// wait up to a few hundred us before it is picked up. --busy-poll keeps
-// checking instead: wait drops to about 1 us, but one core runs at 100%.
 void run_consumer(MessageQueue& queue, Processor& processor, const std::atomic<bool>& producer_done,
                   bool busy_poll, LatencyStats& latency) {
     auto last_flush = std::chrono::steady_clock::now();
@@ -173,8 +196,6 @@ void run_consumer(MessageQueue& queue, Processor& processor, const std::atomic<b
             std::int64_t end = mono_clock_ns();
             latency.wait.add(start - msg->recv_mono_ns);
             latency.work.add(end - start);
-            // A REST snapshot is ~64 KB. Slots are reused and a string never
-            // gives memory back on its own, so free it instead of keeping it forever.
             if (msg->kind == StreamKind::RestSnapshot) std::string().swap(msg->payload);
             queue.pop();
             idle = 0;
@@ -239,19 +260,12 @@ int run_live(const Options& opt) {
         net::steady_timer duration_timer(ioc);
         net::steady_timer stats_timer(ioc);
 
-        // A timer that has already expired can't be cancelled any more: its
-        // handler still runs, with no error. So every handler also checks
-        // `stopping`, otherwise the stats timer could re-arm itself after
-        // shutdown and run() would never return.
         bool stopping = false;
         auto shutdown = [&](const char* why) {
             if (stopping) return;
             stopping = true;
             std::fprintf(stderr, "[main] stopping: %s\n", why);
             client.stop();
-            // cancel() alone keeps SIGINT/SIGTERM registered, so a second Ctrl+C
-            // would be swallowed. clear() gives them back their default action,
-            // which kills the process if the clean stop ever gets stuck.
             signals.cancel();
             signals.clear();
             duration_timer.cancel();
@@ -311,7 +325,7 @@ int run_replay(const Options& opt) {
     return rc;
 }
 
-}  // namespace
+}
 
 int main(int argc, char** argv) {
     Options opt;

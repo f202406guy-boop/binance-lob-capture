@@ -1,15 +1,19 @@
 #!/usr/bin/env bash
-# REST snapshot benchmark: how long until every book has its REST snapshot,
-# with --rest-parallel 1, 2, 4 and 8?
+# I used this benchmark to pick the --rest-parallel default. It runs binance_capture live on
+# spot with 20 symbols and --rest-snapshot for 40 s, four copies at once with N = 1, 2, 4 and 8,
+# so all four see the same network. For each N it prints how many of the 20 snapshots arrived,
+# the time from the first market data row (any symbol) to the last rest_snapshot row (any
+# symbol), and how many REST errors the log shows. The awk part reads recv_tsec, recv_tnsec
+# and stream_kind (columns 1, 2 and 4) and skips the header row of each file.
 #
-# Runs binance_capture --venue spot --rest-snapshot on 20 symbols for 40 s,
-# once for each N. The four runs go at the same time, so they see the same
-# network. For each N it prints the time from the first market data row (any
-# symbol) to the last rest_snapshot row (any symbol), how many of the 20
-# snapshots arrived, and how many REST errors the log shows.
+# I ran it twice: 6.703 to 7.226 s with N=1, 3.336 to 3.924 s with 2, 1.750 to 1.849 s with 4
+# and 1.019 to 1.105 s with 8, with 20/20 snapshots and 0 REST errors every time. I went with 4
+# because it's about 3.9x faster than one at a time. 8 only saves another ~0.75 s, but it
+# doubles the TLS handshakes on the io thread that also reads the WebSocket, and the requests
+# already in flight when a 429 comes back. The request weight of a round is the same for any N.
 #
-# Request weight: one run costs 20 x 50 = 1,000, all four 4,000 of Binance's
-# 6,000 a minute per IP. Wait at least 70 s before running it again.
+# Request weight: each copy costs 20 x 50 = 1,000, so all four use 4,000 of Binance's 6,000 a
+# minute per IP. Wait at least 70 s before running it again.
 #
 # usage: bench/rest_parallel_bench.sh [path/to/binance_capture]   default ./build/binance_capture
 
@@ -55,7 +59,6 @@ for n in "${runs[@]}"; do
         continue
     fi
     errors=$(grep -c -e '^\[rest\] .* failed' -e '^\[rest\] HTTP' "$work/n$n.log" || true)
-    # columns: 1 recv_tsec, 2 recv_tnsec, 4 stream_kind; row 1 of each file is the header
     awk -F, -v n="$n" -v total="$total" -v errors="$errors" '
         FNR == 1 { next }
         {

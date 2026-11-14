@@ -1,3 +1,20 @@
+// This header declares WsClient, the network side of the program. It keeps one combined-stream
+// WebSocket connection for all symbols (shard 0), reads each frame, stamps the receive time,
+// strips the {"stream":..,"data":..} envelope and pushes the payload into the SPSC queue that
+// the book thread reads. The queue has 4096 slots, which is 20 to 80 s of data for one symbol.
+//
+// I wrote it with async Beast and it only ever runs on the one io_context thread, so there are
+// no locks inside the client. The thing to be careful about is lifetime: handlers capture
+// `this` and the connection epoch, so the client has to outlive io_context::run(). On any error
+// it reconnects with backoff and bumps the epoch, and a late handler from the old connection
+// sees a different epoch and just returns.
+//
+// With --rest-snapshot it also fetches every symbol's REST depth snapshot after each handshake
+// and queues it as RestSnapshot. It owns one RestClient per request allowed in flight
+// (--rest-parallel), rest_busy_ has one flag per RestClient, and symbols_ keeps the uppercase
+// names because that's what the REST url wants. I ask for limit=1000 and not 5000, because on
+// spot 5000 costs 250 request weight instead of 50, for levels the program never writes.
+
 #pragma once
 
 #include <chrono>
@@ -35,17 +52,6 @@ struct Endpoint {
 
 Endpoint make_endpoint(Venue venue, const std::vector<std::string>& symbols);
 
-// Async Beast client for one combined-stream connection (shard 0). Runs on the
-// io_context thread only. It reads frames, stamps the receive time, strips the
-// {"stream":..,"data":..} envelope and hands the payload to the queue. On any
-// error it reconnects with backoff and bumps conn_epoch.
-//
-// The client must outlive io_context::run(); handlers capture `this` and the
-// connection epoch, and a handler from an old connection just returns.
-//
-// With rest_snapshot it also fetches a REST depth snapshot for every symbol
-// after each handshake, up to rest_parallel symbols at a time, and queues it as
-// RestSnapshot.
 class WsClient {
 public:
     WsClient(boost::asio::io_context& ioc, boost::asio::ssl::context& ssl_ctx, Venue venue,
@@ -88,8 +94,8 @@ private:
     boost::asio::steady_timer retry_timer_;
     boost::asio::steady_timer close_timer_;
     std::vector<std::unique_ptr<RestClient>> rest_;
-    std::vector<bool> rest_busy_;  // one flag per RestClient
-    std::vector<std::string> symbols_;  // uppercase, for the REST url
+    std::vector<bool> rest_busy_;
+    std::vector<std::string> symbols_;
     std::string rest_host_;
     std::string rest_path_;
     std::optional<Socket> ws_;

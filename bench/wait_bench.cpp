@@ -1,15 +1,21 @@
-// Wait strategy benchmark: how should the book thread wait for new messages?
+// I wrote this benchmark to decide how the book thread should wait for new messages. A producer
+// thread pushes a timestamp into the same SpscQueue the program uses, once every 10 ms (roughly
+// how often a live symbol sends something), and the consumer records how long each one sat in
+// the queue before it was seen. It also prints how much CPU the process used while waiting.
 //
-// A producer thread pushes a timestamp into the same SpscQueue the program
-// uses, once every 10 ms (roughly how often a live symbol sends something).
-// The consumer records how long each one sat in the queue before it was seen.
-// Three ways for the consumer to wait when the queue is empty:
-//   sleep    - yield 64 times, then sleep 200 us (default in main.cpp)
-//   spin     - keep checking and never sleep (--busy-poll)
-//   condvar  - block on a condition variable that the producer signals
-// It also prints how much CPU the process used while waiting.
+// It tries three ways for the consumer to wait when the queue is empty:
+//   sleep    yield 64 times, then sleep 200 us (the default in main.cpp)
+//   spin     keep checking and never sleep (--busy-poll)
+//   condvar  block on a condition variable that the producer signals
 //
-// usage: wait_bench [messages]     default 500, about 5 s per strategy
+// On my machine (WSL2) sleep got p50 225 us at 5.7% of a core, spin got p50 0.9 us but used a
+// full core, and condvar got p50 246 us at 1.4%, because waking a thread is slow inside the VM.
+// Spinning is the only way to get near 1 us, but it burns a core, so I kept sleep as the
+// default and made spinning the --busy-poll option. I didn't use the condition variable: its
+// p50 was no better than sleep's, and it would put a mutex on the per-message path.
+//
+// usage: wait_bench [messages]   default 500, about 5 s per strategy
+// Build it with `cmake --build build --target wait_bench`.
 
 #include <algorithm>
 #include <atomic>
@@ -93,7 +99,7 @@ void run(Mode mode, int messages) {
                 pct(50), pct(99), static_cast<double>(waits.back()) / 1000.0, 100.0 * cpu / wall);
 }
 
-}  // namespace
+}
 
 int main(int argc, char** argv) {
     int messages = argc > 1 ? std::atoi(argv[1]) : 500;

@@ -1,3 +1,15 @@
+// The code behind BookSide. The constructor reserves 8192 levels per side up front, so in the
+// normal case the vector doesn't have to reallocate while the capture runs. set() finds the
+// spot with std::lower_bound and better(), so the same code works for bids and asks, and then
+// updates, inserts or erases (a size of 0 for a price we don't have is just ignored).
+// replace_top() first pops every level from the best down to the snapshot's worst price, then
+// pushes the snapshot back on in reverse (worst first, since the best has to end up at the
+// back), skipping zero sizes. level(i) counts from the best price and gives an empty Level
+// past the end, which is how missing levels turn into 0 in the order book CSV. In the
+// callgrind profile of a replay, set() is the biggest cost (about 43%, almost all of it the
+// memmove), but live that's still only tens of microseconds at p99. tests/unit_tests.cpp
+// (test_book_side) covers all of this, including replace_top on both sides.
+
 #include "order_book.h"
 
 #include <algorithm>

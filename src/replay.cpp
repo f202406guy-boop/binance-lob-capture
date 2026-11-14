@@ -1,3 +1,20 @@
+// This file is replay mode. It reads a market data CSV back into RawMessages and feeds them to
+// the same Processor::process() that live mode uses. That's the whole trick behind getting a
+// byte-for-byte identical order book file: the book code doesn't know whether a message came
+// from the socket or from disk. Receive time, conn_epoch and conn_seq all come from the row,
+// so decisions like resetting the book on a new conn_epoch happen exactly like they did live.
+// The header has to match exactly (a trailing \r is fine). I read line by line, and if
+// split_csv_row() says a quote is still open I glue the next line on, newline included, and
+// try again, so a quoted field with a newline in it still works. Empty lines are skipped.
+// parse_number() uses std::from_chars and also checks that it used up the whole field, so
+// something like "12x" fails instead of quietly reading 12. A row without 9 fields or with a
+// value that doesn't parse counts as a parse error and is skipped, and only the first 10 get
+// printed so a broken file doesn't flood stderr. One market data file is one symbol, so the
+// first good row picks the venue and symbol and creates the Processor, and rows for any other
+// symbol are skipped. Replay passes an empty market data path, so only the order book file
+// gets written. msg.payload.swap() moves the payload out of the fields vector without a copy.
+// tests/unit_tests.cpp checks replay against live in test_spot_sync and test_rest_snapshot.
+
 #include "replay.h"
 
 #include <charconv>
@@ -20,7 +37,7 @@ bool parse_number(const std::string& s, T& out) {
     return res.ec == std::errc() && res.ptr == s.data() + s.size();
 }
 
-}  // namespace
+}
 
 bool replay_file(const std::string& path, const std::string& output_dir, Metrics& metrics) {
     std::ifstream in(path, std::ios::binary);

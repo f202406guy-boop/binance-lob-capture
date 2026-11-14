@@ -1,3 +1,15 @@
+// This header has the book thread's main class, Processor, and the structs it works with.
+// Processor takes the messages in order, writes the market data row, updates the book and
+// writes the order book row. Live mode and replay both go through the same process(), and
+// that's the main reason replay gives back the live order book file byte for byte.
+// DepthMsg is one parsed depth message (a diff, a depth5 or a REST snapshot): U goes in
+// first_id, u (or lastUpdateId on spot depth5 and REST) in last_id, and pu (USD-M only) in
+// prev_id. SymbolState is everything I keep per symbol: both book sides, the id the book is
+// at, a depth5 that's waiting for the diffs to catch up, and the REST snapshot stuff.
+// For the REST snapshot each symbol keeps its last kRecentDiffs diffs in a small ring. 30 is
+// 3 s at 100 ms, so a snapshot that shows up a bit late can still be brought forward, in its
+// own rest_bids/rest_asks next to the live book. market_data_path is empty in replay, since
+// the market data file already exists there and nothing gets written to it.
 #pragma once
 
 #include <cstdint>
@@ -22,15 +34,12 @@ constexpr const char* kOrderbookHeader =
 
 constexpr int kBookDepth = 5;
 
-// How many recent diffs each symbol keeps (3 s at 100 ms) so a REST snapshot
-// that arrives a bit later can be brought forward to the live book's id.
 constexpr std::size_t kRecentDiffs = 30;
 
-// One parsed depth message (diff, depth5 or REST snapshot).
 struct DepthMsg {
-    std::uint64_t first_id = 0;  // U
-    std::uint64_t last_id = 0;   // u, or lastUpdateId on spot depth5 and REST
-    std::uint64_t prev_id = 0;   // pu (usdm only)
+    std::uint64_t first_id = 0;
+    std::uint64_t last_id = 0;
+    std::uint64_t prev_id = 0;
     bool has_prev = false;
     std::vector<Level> bids;
     std::vector<Level> asks;
@@ -38,7 +47,7 @@ struct DepthMsg {
 
 struct SymbolOutput {
     std::string symbol;
-    std::string market_data_path;  // empty in replay mode
+    std::string market_data_path;
     std::string orderbook_path;
 };
 
@@ -57,8 +66,6 @@ struct SymbolState {
     std::vector<Level> check_bids;
     std::vector<Level> check_asks;
 
-    // REST snapshot: the last few diffs (a ring), and a full-depth book built
-    // from a snapshot that is still catching up with the live book.
     std::vector<DepthMsg> recent;
     std::size_t recent_next = 0;
     std::size_t recent_count = 0;
@@ -71,9 +78,6 @@ struct SymbolState {
     BufferedFile orderbook;
 };
 
-// Consumes RawMessages in order: writes the market data row, updates the book
-// and writes the order book row. Live mode and replay mode both go through
-// process(), which is why replay reproduces the live order book file exactly.
 class Processor {
 public:
     Processor(Venue venue, Metrics& metrics);

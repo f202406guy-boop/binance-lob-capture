@@ -1,3 +1,13 @@
+// The code behind csv.h. append_int() and append_uint() use std::to_chars into a small stack
+// buffer, which is quick and doesn't allocate. split_csv_row() is a small state machine that
+// tracks whether it's inside quotes. A doubled quote inside quotes turns back into one quote,
+// and a \r outside quotes is dropped, so a file with Windows line endings doesn't leave a \r
+// stuck on the last field. In BufferedFile I turn off stdio's own buffering with
+// setvbuf(_IONBF), since I already buffer in a std::string and didn't want every byte copied
+// twice. open() reserves 256 KB plus some slack, so the buffer normally never has to grow.
+// A short fwrite or a failed fclose counts as a write error, which shows up in the
+// write_errors counter. Quoting and splitting are tested in tests/unit_tests.cpp (test_csv).
+
 #include "csv.h"
 
 #include <charconv>

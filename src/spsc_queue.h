@@ -1,14 +1,21 @@
+// This is the lock-free ring between the two threads. The network thread is the only producer
+// and the book thread is the only consumer, so single-producer single-consumer is all I need,
+// and it means no mutex or condition variable on the per-message path. The producer gets a
+// slot with begin_push(), fills it in place and publishes it with end_push(). The consumer
+// reads it in place with front() and releases it with pop(). Slots are reused, so the strings
+// inside keep their capacity and the steady state does no heap allocation. The one technical
+// bit: head_ and tail_ are atomics with acquire/release ordering on separate 64-byte cache
+// lines, so the two threads don't fight over one line, and each side keeps a cached copy of
+// the other side's index and only reloads it when the ring looks full or empty. N has to be
+// a power of two so the slot index is just a mask. If the ring is full, begin_push() gives
+// nullptr and the network thread waits instead of dropping a message (see ws_client.cpp).
+
 #pragma once
 
 #include <atomic>
 #include <cstddef>
 #include <vector>
 
-// Single-producer single-consumer ring buffer. The producer fills a slot in
-// place and publishes it, the consumer reads it in place and then releases it.
-// Slots are reused, so strings inside them keep their capacity and the steady
-// state does no heap allocation. head_ and tail_ live on separate cache lines
-// so the two threads do not fight over one line.
 template <typename T, std::size_t N>
 class SpscQueue {
     static_assert(N >= 2 && (N & (N - 1)) == 0, "queue size must be a power of two");
@@ -18,7 +25,6 @@ public:
     SpscQueue(const SpscQueue&) = delete;
     SpscQueue& operator=(const SpscQueue&) = delete;
 
-    // producer side
     T* begin_push() {
         std::size_t head = head_.load(std::memory_order_relaxed);
         if (head - cached_tail_ == N) {
@@ -32,7 +38,6 @@ public:
         head_.store(head_.load(std::memory_order_relaxed) + 1, std::memory_order_release);
     }
 
-    // consumer side
     T* front() {
         std::size_t tail = tail_.load(std::memory_order_relaxed);
         if (tail == cached_head_) {

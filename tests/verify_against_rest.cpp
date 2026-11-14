@@ -1,8 +1,23 @@
-// Accuracy check against REST /depth snapshots that another process saved
-// while the program was capturing. A snapshot is the true book at its
-// lastUpdateId L. It is brought forward with the captured diffs (same rules as
-// the processor) until it is at the same update id as the processor's book,
-// and then the two books are compared level by level from the best price.
+// This is my full-depth check against Binance. The depth5 check only covers the top 5 levels,
+// so during a live capture I had a separate process save REST /depth snapshots (limit=1000)
+// every 10 s, and this program compares the rest of the book against them.
+//
+// usage: verify_against_rest MARKET_DATA_CSV SNAPSHOT.json [SNAPSHOT.json ...]
+// Build it with `cmake --build build --target verify_against_rest`. It isn't part of ctest.
+// Each snapshot file is a raw /depth response: lastUpdateId plus bids/asks, best price first.
+//
+// It replays the market data file through the same Processor the program uses. A snapshot is
+// the true book at its lastUpdateId L, so I bring each one forward with the captured diffs,
+// with the same sequence rules (skip u <= L, give up if a diff's previous id is past the
+// snapshot book), until it's at the same update id as the processor's book. Then both sides
+// are compared level by level from the best price. Only prices from the best down to the
+// snapshot's last price count, because deeper levels in the snapshot book are just the ones
+// later diffs touched. It prints one line per snapshot and a summary.
+//
+// On the 10-minute BTCUSDT captures (spot and USD-M), all 103 snapshots were exact through the
+// top 100 levels, and every first mismatch further down was at a price outside what our own
+// startup snapshot covered. I also gave it a snapshot I edited on purpose, to make sure it
+// catches a real difference, and it did.
 
 #include <algorithm>
 #include <charconv>
@@ -41,11 +56,11 @@ struct Diff {
 struct Snapshot {
     std::string name;
     std::uint64_t rest_id = 0;
-    std::vector<Level> bids;  // as fetched, best first
+    std::vector<Level> bids;
     std::vector<Level> asks;
     Status status = Status::Waiting;
     std::uint64_t book_id = 0;
-    std::unique_ptr<BookSide> book_bids;  // only while started
+    std::unique_ptr<BookSide> book_bids;
     std::unique_ptr<BookSide> book_asks;
     std::size_t bid_levels = 0;
     std::size_t ask_levels = 0;
@@ -177,8 +192,6 @@ void advance(Snapshot& snap, const Diff& d) {
     snap.book_id = d.last_id;
 }
 
-// Only prices from the best down to the snapshot's last price are known exactly.
-// Deeper levels in the snapshot book are just the ones later diffs touched.
 std::size_t levels_in_range(const BookSide& side, const std::vector<Level>& fetched, bool is_bid) {
     if (fetched.empty()) return 0;
     std::int64_t worst = fetched.back().price;
@@ -232,7 +245,7 @@ void compare(Snapshot& snap, const SymbolState& s) {
     snap.book_asks.reset();
 }
 
-}  // namespace
+}
 
 int main(int argc, char** argv) {
     if (argc < 3) {

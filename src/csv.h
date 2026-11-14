@@ -1,3 +1,13 @@
+// This is the CSV part: writing fields with RFC 4180 quoting, turning numbers into text,
+// splitting a row back into fields for replay, and BufferedFile for the output files. A field
+// only gets quotes if it has a comma, quote or newline in it, and any quote inside is doubled.
+// In practice that's just the payload_json column. split_csv_row() returns false when the
+// text ends inside a quoted field, so the caller can glue on the next line and try again.
+// BufferedFile owns its FILE* (closed in the destructor) and collects rows in memory, so it
+// goes to the kernel about once per 256 KB instead of once per row. The book thread still
+// does that fwrite itself. A separate writer thread (or io_uring) would take it off the
+// book's path, but for one write every 256 KB I left that for later. The code is in csv.cpp.
+
 #pragma once
 
 #include <cstdint>
@@ -6,18 +16,12 @@
 #include <string_view>
 #include <vector>
 
-// RFC 4180: quote the field if it has a comma, quote or newline, and double
-// any quote inside it.
 void append_csv_field(std::string& out, std::string_view field);
 void append_int(std::string& out, std::int64_t v);
 void append_uint(std::string& out, std::uint64_t v);
 
-// Splits one CSV record. Returns false if the text ends inside a quoted field,
-// so the caller can append the next line and try again.
 bool split_csv_row(std::string_view line, std::vector<std::string>& fields);
 
-// Owns a FILE* and collects rows in memory, so we hit the kernel once per
-// ~256 KB instead of once per row.
 class BufferedFile {
 public:
     BufferedFile() = default;

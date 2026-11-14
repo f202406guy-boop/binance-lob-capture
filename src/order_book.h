@@ -1,3 +1,16 @@
+// This file is one side of the order book (BookSide), the code is in order_book.cpp. I keep
+// the levels in a sorted std::vector from worst to best, so the best price sits at the back
+// and the top 5 are just the last 5 elements. Lookup is a binary search. An insert or erase
+// deep in the book has to shift the levels above it (a memmove), but the whole side is one
+// contiguous block with no allocation per level, which the CPU cache and prefetcher like.
+// I thought about std::map, but every level would be its own heap node and each lookup would
+// chase pointers. A flat array indexed by price tick would be O(1), but it needs a fixed
+// price band and the tick size for each symbol, which felt like too much for this project.
+// set() follows Binance's diff rules: qty is the new absolute size and 0 removes the level.
+// replace_top() is for depth5: the snapshot (best first) is the truth for every price from
+// the best down to its last level, and deeper levels are kept. Prices and sizes are int64
+// scaled by 10^8 (see decimal.h).
+
 #pragma once
 
 #include <cstddef>
@@ -13,20 +26,12 @@ inline bool operator==(const Level& a, const Level& b) {
     return a.price == b.price && a.qty == b.qty;
 }
 
-// One side of the book, kept sorted from worst to best so the best price sits
-// at the back of the vector and the top 5 are the last 5 elements. Lookup is
-// a binary search. An insert or erase deep in the book shifts the levels above
-// it (a memmove), but the whole side is one contiguous block, which the CPU
-// cache and prefetcher handle well.
 class BookSide {
 public:
     explicit BookSide(bool is_bid);
 
-    // Binance diff semantics: qty is the new absolute size, 0 removes the level.
     void set(std::int64_t price, std::int64_t qty);
 
-    // depth5 semantics: the snapshot (best first) is the truth for every price
-    // from the best down to its last level. Deeper levels are kept.
     void replace_top(const std::vector<Level>& snapshot);
     bool top_matches(const std::vector<Level>& snapshot) const;
 

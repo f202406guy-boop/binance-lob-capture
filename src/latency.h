@@ -1,3 +1,15 @@
+// This file has the latency histogram behind the [latency] lines. LatencyStats holds two of
+// them: wait is the time from reading the frame off the socket to the book thread starting on
+// it, and work is the time spent inside Processor::process() (parse, book update, CSV row).
+// main.cpp measures both with steady_clock, not the wall clock. I count in 1 microsecond
+// buckets up to 10 ms, so memory stays fixed (about 80 KB per histogram) however long the
+// capture runs, instead of keeping every sample and sorting at the end. Anything slower goes
+// in the last bucket, but max() still keeps the real value, and a negative value counts as 0.
+// percentile(p) walks the buckets until it has seen ceil(p% of the count) samples, so it
+// gives the latency in microseconds that p percent of the samples are at or below. Only the
+// book thread uses these while it runs, so they're plain integers, no atomics. It's tested
+// in tests/unit_tests.cpp (test_latency), including a 50 ms sample past the last bucket.
+
 #pragma once
 
 #include <cmath>
@@ -5,9 +17,6 @@
 #include <cstdio>
 #include <vector>
 
-// Counts latencies in 1 microsecond buckets up to 10 ms. Anything slower lands
-// in the last bucket, but max() still reports the real value. Memory stays
-// fixed no matter how long the capture runs.
 class LatencyHistogram {
 public:
     static constexpr int kBuckets = 10000;
@@ -26,7 +35,6 @@ public:
     std::uint64_t count() const { return count_; }
     std::int64_t max() const { return max_us_; }
 
-    // Latency in microseconds that p percent of the samples are at or below.
     std::int64_t percentile(double p) const {
         if (count_ == 0) return 0;
         std::uint64_t need = static_cast<std::uint64_t>(std::ceil(p / 100.0 * static_cast<double>(count_)));
@@ -45,8 +53,6 @@ private:
     std::int64_t max_us_ = 0;
 };
 
-// wait: from reading the frame off the socket to the book thread starting on it.
-// work: time spent inside Processor::process (parse, book update, CSV row).
 struct LatencyStats {
     LatencyHistogram wait;
     LatencyHistogram work;

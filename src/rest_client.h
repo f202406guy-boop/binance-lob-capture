@@ -1,3 +1,15 @@
+// This header declares RestClient, a small async HTTPS GET client. I only use it for the REST
+// /depth snapshot behind --rest-snapshot. It runs on the same io_context thread as the
+// WebSocket, so a slow request never blocks the socket read.
+//
+// Each client does one request at a time: call get(), wait for done, then call get() again.
+// To have several requests in flight, WsClient just makes several clients (--rest-parallel,
+// 1 to 8, default 4). Every request opens a new connection.
+//
+// done is called exactly once per get(), unless stop() was called first, with the HTTP status,
+// or 0 if the request never got a response. Like WsClient, the handlers capture `this`, so the
+// client has to outlive io_context::run().
+
 #pragma once
 
 #include <functional>
@@ -11,13 +23,6 @@
 #include <boost/beast/http.hpp>
 #include <boost/beast/ssl.hpp>
 
-// Async HTTPS GET on the io_context thread, used for the REST depth snapshot.
-// One request at a time (wait for done before the next get), and every request
-// opens a new connection.
-//
-// done is called exactly once per get(), unless stop() was called first, with
-// the HTTP status (0 if the request never got a response). The client must
-// outlive io_context::run(); handlers capture `this`.
 class RestClient {
 public:
     using Done = std::function<void(int status, std::string body)>;

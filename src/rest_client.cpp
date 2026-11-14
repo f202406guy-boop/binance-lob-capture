@@ -1,3 +1,18 @@
+// This is the REST client behind --rest-snapshot. Every step is async on the io_context thread
+// the WebSocket uses: resolve, connect, TLS handshake, write the GET, read the response.
+// Connect, handshake, write and read each get 10 s.
+//
+// TLS is set up the same way as the WebSocket: SNI is set and the certificate has to match the
+// host name. If setting SNI fails I post the failure instead of handling it right there, so
+// done is never called from inside get(). Since each request has its own connection, after the
+// response I just drop the socket, with no TLS shutdown. A non-200 answer is logged and handed
+// back with an empty body, and a failure comes back as status 0. In finish() I move done_ out
+// before calling it, because the callback may start the next request on this same client.
+//
+// stop() sets a flag and closes the socket, and every handler checks the flag first. The one
+// thing it can't do is cancel a getaddrinfo that's already running, so if DNS stops answering
+// in the middle of a round, shutdown can be delayed by up to ~30 s.
+
 #include "rest_client.h"
 
 #include <chrono>
@@ -26,7 +41,6 @@ void RestClient::get(const std::string& host, const std::string& target, Done do
 
     if (!SSL_set_tlsext_host_name(stream_->native_handle(), host_.c_str())) {
         beast::error_code ec(static_cast<int>(::ERR_get_error()), net::error::get_ssl_category());
-        // post it, so done is never called from inside get()
         net::post(ioc_, [this, ec] { fail("sni", ec); });
         return;
     }
@@ -73,7 +87,6 @@ void RestClient::on_write(beast::error_code ec) {
 void RestClient::on_read(beast::error_code ec) {
     if (stopped_) return;
     if (ec) return fail("read", ec);
-    // We open a new connection per request, so no TLS shutdown, just drop the socket.
     close_socket();
     int status = static_cast<int>(res_.result_int());
     if (status != 200) {
@@ -91,7 +104,6 @@ void RestClient::fail(const char* what, beast::error_code ec) {
 }
 
 void RestClient::finish(int status, std::string body) {
-    // Move done_ out first, the callback may start the next request.
     Done done = std::move(done_);
     done_ = nullptr;
     if (done) done(status, std::move(body));

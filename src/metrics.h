@@ -1,3 +1,11 @@
+// These are the counters printed to stderr every 10 s and at exit (the [stats] and [final]
+// lines). The network thread bumps a few of them (messages, reconnects, queue_full_waits,
+// unknown_streams), the book thread bumps the rest, and the stats timer reads them on the io
+// thread, so they're std::atomic. bump() uses memory_order_relaxed, because each counter is
+// just a number on its own and nothing else is synchronized through it, so there's no reason
+// to pay for stronger ordering. I kept it as one plain struct and one fprintf instead of
+// pulling in a metrics library for 23 numbers.
+
 #pragma once
 
 #include <atomic>

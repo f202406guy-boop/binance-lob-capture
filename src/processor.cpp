@@ -1,3 +1,32 @@
+// This is the book thread's code. Every message goes through process() in the order it was
+// read: first the market data row, then the book update and the order book row.
+// For diffs I use four rules, where last is the update id the book is at. If the book isn't
+// valid yet, I skip it. If u <= last, it's old and I drop it. If the previous id (U - 1
+// on spot, pu on USD-M) is past last, something is missing, so I reset and write an R row.
+// Otherwise I apply it and write a D row. A new conn_epoch also resets the book, because we
+// may have missed updates while reconnecting. That only uses the conn_epoch column, so
+// replay makes the same call.
+// I treat depth5 as a check, not as the truth. While we're in sync the diffs build the book,
+// and a depth5 with the same id gets compared with our top 5. If it agrees nothing happens,
+// if not I trust it and replace the top levels (a repair). It also seeds the book at the
+// start and after a reset. On spot it shows up a few ms before the diff with the same id, so
+// I hold it until that diff lands. On USD-M the depth5 id usually falls inside the next
+// diff's U..u, so an exact compare can't happen. There I fold the snapshot in just before
+// that diff. That's safe because the diff has the final value at u for every level that
+// changed, so the book still ends exact at u. At first a fold didn't write a row, but I
+// changed it so every applied depth5 (seed, repair or fold) writes its own S row with
+// exactly the top 5 Binance sent. One that only confirms the book writes nothing.
+// Trades never touch the book. The T row (only while the book is valid) just marks who the
+// aggressor was: buyer is maker means the seller hit the bid, so S.
+// With --rest-snapshot the REST /depth response becomes a separate full-depth book. Its id
+// is usually a bit behind or ahead of ours, so I bring it forward with the last 30 diffs I
+// keep and then the new ones, using the same rules, and drop it if a diff is missing. Once
+// both are at the same id I compare the top 5 and swap it in with an S row (right away if
+// the book wasn't valid). A reset keeps those diffs and a pending REST book, since update
+// ids are global, so a REST book that's still continuous takes over right after a gap.
+// The symbol id is FNV-1a of the name, so it's the same in every run, in replay, and for any
+// --symbols order. I test all this in tests/unit_tests.cpp (test_spot_sync, test_usdm_sync,
+// test_rest_snapshot, and replace_top in test_book_side).
 #include "processor.h"
 
 #include <cstdio>
@@ -9,8 +38,6 @@ namespace {
 
 constexpr std::int64_t kNanos = 1000000000;
 
-// FNV-1a of the symbol name: stable across runs, machines and replay,
-// and independent of the order symbols are given on the command line.
 std::int32_t instrument_id(const std::string& symbol) {
     std::uint32_t h = 2166136261u;
     for (unsigned char c : symbol) {
@@ -55,7 +82,7 @@ bool sorted_best_first(const std::vector<Level>& levels, bool is_bid) {
     return true;
 }
 
-}  // namespace
+}
 
 Processor::Processor(Venue venue, Metrics& metrics) : venue_(venue), metrics_(metrics) {
     depth_.bids.reserve(1024);
@@ -89,8 +116,6 @@ void Processor::process(RawMessage& msg) {
     SymbolState& s = *symbols_[msg.symbol_index];
     if (s.market_data.is_open()) write_market_data(s, msg);
 
-    // A new connection means we may have missed updates while reconnecting,
-    // so the book cannot be trusted until the next depth5 arrives.
     if (s.seen_epoch && msg.conn_epoch != s.epoch && s.valid) reset_book(s, msg);
     s.seen_epoch = true;
     s.epoch = msg.conn_epoch;
@@ -112,8 +137,6 @@ void Processor::on_diff(SymbolState& s, RawMessage& msg) {
         count_parse_error(s, "depth_diff");
         return;
     }
-    // Every diff is kept for a while and also moves a pending REST book
-    // forward. Without --rest-snapshot nothing else happens with them.
     remember_diff(s);
     advance_rest_book(s, depth_);
     apply_diff(s, msg);
@@ -138,17 +161,11 @@ void Processor::apply_diff(SymbolState& s, RawMessage& msg) {
     }
 
     if (s.check_pending && depth_.last_id > s.check_id) {
-        // The snapshot's id is inside this diff's range, so the two can never be
-        // compared exactly (on USD-M depth5 and diffs are cut at different times).
-        // Fold the snapshot in first; the diff then moves every level it touches
-        // up to u, which leaves the book exact at u.
         s.bids.replace_top(s.check_bids);
         s.asks.replace_top(s.check_asks);
         s.check_pending = false;
         bump(metrics_.depth5_folded);
         bump(metrics_.depth5_applied);
-        // Every applied depth5 gets its own row. Its top 5 are exactly what
-        // Binance published at the snapshot's id; the D row for the diff follows.
         write_book_row(s, msg, 'S', 'N');
     }
 
@@ -200,17 +217,12 @@ void Processor::on_depth5(SymbolState& s, RawMessage& msg) {
         return;
     }
 
-    // The snapshot is ahead of the diffs applied so far (on spot it arrives a
-    // few ms before the diff with the same id). Keep it until the diffs catch up.
     s.check_pending = true;
     s.check_id = id;
     s.check_bids = depth_.bids;
     s.check_asks = depth_.asks;
 }
 
-// In sync, the diffs are the source of truth and depth5 is the check. If the
-// diff-built top 5 disagrees with the snapshot at the same update id, trust the
-// snapshot: replace the top levels and write an S row.
 void Processor::verify_top(SymbolState& s, const RawMessage& msg, const std::vector<Level>& bids,
                            const std::vector<Level>& asks) {
     bump(metrics_.depth5_checked);
@@ -239,15 +251,9 @@ void Processor::on_trade(SymbolState& s, RawMessage& msg) {
     }
     bump(metrics_.trades);
     if (!s.valid) return;
-    // Trades do not change a diff-built book; the row only marks that a trade
-    // printed, with the aggressor side (buyer is maker -> the seller hit the bid).
     write_book_row(s, msg, 'T', buyer_is_maker ? 'S' : 'B');
 }
 
-// REST /depth snapshot (up to 1000 levels a side). It is a moment in time
-// with its own update id, which is usually a little behind or ahead of the
-// live book. Build a full-depth book from it, bring it forward with the diffs
-// we kept, and swap it in once both books are at the same update id.
 void Processor::on_rest_snapshot(SymbolState& s, RawMessage& msg) {
     if (!parse_depth(msg.payload) || (depth_.bids.empty() && depth_.asks.empty()) ||
         !sorted_best_first(depth_.bids, true) || !sorted_best_first(depth_.asks, false)) {
@@ -275,8 +281,6 @@ void Processor::remember_diff(SymbolState& s) {
     if (s.recent_count < kRecentDiffs) ++s.recent_count;
 }
 
-// Same sequence rules as the live book: skip what the snapshot already has,
-// and give up on the snapshot if a diff is missing.
 void Processor::advance_rest_book(SymbolState& s, const DepthMsg& d) {
     if (!s.rest_pending || d.last_id <= s.rest_id) return;
     if (prev_update_id(d) > s.rest_id) {
@@ -291,9 +295,8 @@ void Processor::advance_rest_book(SymbolState& s, const DepthMsg& d) {
 
 void Processor::try_rest_swap(SymbolState& s, const RawMessage& msg) {
     if (!s.rest_pending) return;
-    if (s.valid && s.rest_id != s.last_update_id) return;  // one of them still has to catch up
+    if (s.valid && s.rest_id != s.last_update_id) return;
 
-    // Both books are at the same id now, so their top 5 should agree.
     if (s.valid) {
         for (int i = 0; i < kBookDepth; ++i) {
             if (!(s.bids.level(i) == s.rest_bids.level(i)) || !(s.asks.level(i) == s.rest_asks.level(i))) {
@@ -354,9 +357,6 @@ void Processor::reset_book(SymbolState& s, const RawMessage& msg) {
     s.valid = false;
     s.last_update_id = 0;
     s.check_pending = false;
-    // The kept diffs and a pending REST book stay: update ids are global, so
-    // advance_rest_book still catches any hole, and a REST book that is still
-    // continuous is swapped in right after this reset.
     bump(metrics_.book_resets);
     write_book_row(s, msg, 'R', 'N');
 }

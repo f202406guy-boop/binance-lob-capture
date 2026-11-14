@@ -1,3 +1,25 @@
+// This is the network thread. Everything here runs on one io_context thread with async Beast:
+// resolve, connect, TLS handshake, WebSocket handshake, then a read loop that stamps the
+// receive time, looks up the stream name and copies the minified payload into a queue slot.
+//
+// Every connection has an epoch number and every handler carries the epoch it started with,
+// so after a reconnect the old handlers see a different epoch and just return. On any error
+// fail() closes the socket, bumps the epoch and retries after 0.5 s, doubling up to 30 s, and
+// the wait goes back to 0.5 s after a good handshake. Binance needs SNI, so I set it, and the
+// certificate has to match the host name. After the TLS handshake, Beast's idle timeout (20 s)
+// and keep-alive pings turn a silent dead connection into a read error, so it reconnects.
+//
+// simdjson reads a bit past the end of its input, so each frame is copied into my own buffer
+// that always has the padding. If the queue is full I wait, which pushes back on the socket,
+// instead of dropping the message and leaving a hole in the market data file.
+//
+// The REST snapshots run on this same thread, so the WebSocket read is never blocked and only
+// one thread ever pushes into the queue. I allow one round per 60 s at most, so a connection
+// that keeps dropping can't burn through Binance's request weight. On HTTP 429 (too many
+// requests) or 418 (IP banned) it stops asking on that connection and those books seed from
+// depth5. Snapshots from an old connection are dropped (that RestClient sits out until its
+// late answer comes in) and failed ones are skipped. On stop I send a polite close, 2 s max.
+
 #include "ws_client.h"
 
 #include <algorithm>
@@ -36,7 +58,7 @@ std::string to_upper(std::string s) {
 const char* const kSuffixes[] = {"@depth@100ms", "@depth5@100ms", "@trade"};
 const StreamKind kKinds[] = {StreamKind::DepthDiff, StreamKind::Depth5, StreamKind::Trade};
 
-}  // namespace
+}
 
 Endpoint make_endpoint(Venue venue, const std::vector<std::string>& symbols) {
     Endpoint e;
@@ -102,7 +124,6 @@ void WsClient::connect() {
     ws_.emplace(ioc_, ssl_ctx_);
     connected_ = false;
 
-    // Binance needs SNI, and we verify that the certificate matches the host.
     if (!SSL_set_tlsext_host_name(ws_->next_layer().native_handle(), endpoint_.host.c_str())) {
         beast::error_code ec(static_cast<int>(::ERR_get_error()), net::error::get_ssl_category());
         fail(epoch_, "sni", ec);
@@ -138,8 +159,6 @@ void WsClient::on_tls_handshake(std::uint32_t epoch, beast::error_code ec) {
     if (epoch != epoch_ || stopping_) return;
     if (ec) return fail(epoch, "tls handshake", ec);
 
-    // Beast takes over timeouts from here: idle_timeout plus keep-alive pings
-    // turn a silent dead connection into a read error, which triggers a reconnect.
     beast::get_lowest_layer(*ws_).expires_never();
     websocket::stream_base::timeout opt{};
     opt.handshake_timeout = std::chrono::seconds(10);
@@ -164,8 +183,6 @@ void WsClient::on_ws_handshake(std::uint32_t epoch, beast::error_code ec) {
                  endpoint_.target.c_str());
     read();
     if (rest_enabled_) {
-        // At most one round of snapshots a minute, so a connection that keeps
-        // dropping can't run through Binance's request weight limit.
         auto now = std::chrono::steady_clock::now();
         if (!rest_started_ || now - last_rest_round_ >= std::chrono::seconds(60)) {
             rest_started_ = true;
@@ -178,9 +195,6 @@ void WsClient::on_ws_handshake(std::uint32_t epoch, beast::error_code ec) {
     }
 }
 
-// Fetches the REST snapshots, one symbol per idle RestClient, so at most
-// rest_parallel requests are in flight. A client that still waits for a request
-// from an old connection is skipped; its on_snapshot() calls us again.
 void WsClient::next_snapshot() {
     for (std::size_t c = 0; c < rest_.size(); ++c) {
         if (stopping_ || !connected_ || rest_next_ >= symbols_.size()) return;
@@ -199,8 +213,6 @@ void WsClient::on_snapshot(std::size_t client, std::uint32_t epoch, std::uint32_
                            std::string body) {
     rest_busy_[client] = false;
     if (stopping_) return;
-    // A snapshot from an old connection is dropped and rest_next_ stays as the
-    // new handshake set it. A failed request was already logged; skip that symbol.
     if (epoch == epoch_) {
         if (status == 200) {
             recv_mono_ns_ = mono_clock_ns();
@@ -208,8 +220,6 @@ void WsClient::on_snapshot(std::size_t client, std::uint32_t epoch, std::uint32_
             std::fprintf(stderr, "[rest] %s snapshot %zu bytes (epoch=%u)\n", symbols_[index].c_str(), body.size(),
                          epoch);
         }
-        // 429 = too many requests, 418 = IP banned for not backing off after a
-        // 429. Stop asking on this connection; the books use depth5 seeding.
         if (status == 429 || status == 418) {
             std::fprintf(stderr, "[rest] rate limited (HTTP %d), no more snapshots on this connection\n", status);
             rest_next_ = static_cast<std::uint32_t>(symbols_.size());
@@ -239,8 +249,6 @@ void WsClient::on_read(std::uint32_t epoch, beast::error_code ec) {
 void WsClient::handle_frame(std::int64_t recv_ns) {
     bump(metrics_.messages);
     auto data = buffer_.data();
-    // simdjson reads a little past the end of the input, so parse from our own
-    // reused buffer that always has the padding.
     frame_.assign(static_cast<const char*>(data.data()), data.size());
     if (frame_.capacity() - frame_.size() < simdjson::SIMDJSON_PADDING)
         frame_.reserve(frame_.size() + simdjson::SIMDJSON_PADDING);
@@ -263,8 +271,6 @@ void WsClient::handle_frame(std::int64_t recv_ns) {
 }
 
 void WsClient::push(const Route& route, std::string_view data, std::int64_t recv_ns) {
-    // If the consumer falls behind we wait here. That pushes back on the socket
-    // instead of dropping messages, which would break the audit file.
     RawMessage* slot = queue_.begin_push();
     while (slot == nullptr) {
         bump(metrics_.queue_full_waits);
@@ -294,7 +300,7 @@ void WsClient::fail(std::uint32_t epoch, const char* what, beast::error_code ec)
     if (epoch != epoch_ || stopping_) return;
     std::fprintf(stderr, "[ws] %s failed (epoch=%u): %s\n", what, epoch, ec.message().c_str());
     close_socket();
-    connected_ = false;  // so no REST snapshot starts before the next handshake
+    connected_ = false;
 
     ++epoch_;
     bump(metrics_.reconnects);
@@ -318,7 +324,6 @@ void WsClient::stop() {
     if (!ws_) return;
 
     if (connected_ && ws_->is_open()) {
-        // Polite close first, but never wait more than 2s for the server.
         close_timer_.expires_after(std::chrono::seconds(2));
         close_timer_.async_wait([this](beast::error_code) { close_socket(); });
         ws_->async_close(websocket::close_code::normal, [this](beast::error_code) {

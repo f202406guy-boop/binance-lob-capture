@@ -1,3 +1,22 @@
+// These are my unit tests. There's no framework, just a CHECK macro that prints the line of
+// each failed check, and main() returns 1 if anything failed, so ctest sees it.
+//
+// The small parts first: the decimal parser (the int64 limit, more than 8 decimals, bad input),
+// CSV quoting and splitting, BookSide (order, deletes, replace_top on both sides) and the
+// latency histogram (percentiles, and a 50 ms value past the last bucket). Then I feed the
+// Processor small JSON messages by hand. The spot test goes through waiting for a seed, stale
+// diffs, a gap and reset, depth5 checks (including a snapshot that arrives before the diff with
+// its id, and one that disagrees and repairs the top), a reset on a new conn_epoch, a parse
+// error, and the order book header and 26 columns on every row. The USD-M test checks pu
+// continuity and a depth5 that gets folded in before the next diff.
+//
+// The REST test covers a snapshot behind the live book (caught up with the kept diffs, and it
+// shows the live book was missing bid levels), one ahead (it waits for a diff to reach its id),
+// one too old to connect (dropped, book untouched), one right after a reconnect (it seeds the
+// book), one that takes over after a gap, and one on USD-M where pu decides continuity. The
+// spot and REST tests also replay the market data file they wrote and check that the order
+// book file comes out the same. Everything goes to a temp folder that's cleared on each run.
+
 #include <algorithm>
 #include <cstdio>
 #include <filesystem>
@@ -124,7 +143,7 @@ void test_latency() {
     CHECK(h.percentile(99) == 99);
     CHECK(h.percentile(100) == 100);
     CHECK(h.max() == 100);
-    h.add(50 * 1000 * 1000LL);  // 50 ms, past the last bucket
+    h.add(50 * 1000 * 1000LL);
     CHECK(h.max() == 50000);
     CHECK(h.percentile(100) == LatencyHistogram::kBuckets);
     h.add(-5);
@@ -185,7 +204,6 @@ void test_spot_sync(const fs::path& dir) {
     feed(StreamKind::Depth5, R"({"lastUpdateId":100,"bids":[["10.00","1"]],"asks":[["10.10","3"]]})");
     CHECK(m.depth5_stale == 1);
 
-    // snapshot arrives before the diff with the same id: checked once the diff lands
     feed(StreamKind::Depth5, R"({"lastUpdateId":125,"bids":[["10.00","1"]],"asks":[["10.05","2"]]})");
     CHECK(s.check_pending && m.depth5_checked == 1);
     feed(StreamKind::DepthDiff,
@@ -193,7 +211,6 @@ void test_spot_sync(const fs::path& dir) {
     CHECK(!s.check_pending && s.last_update_id == 125);
     CHECK(m.depth5_checked == 2 && m.depth5_mismatch == 0);
 
-    // a snapshot that disagrees with the book repairs the top levels
     feed(StreamKind::Depth5, R"({"lastUpdateId":125,"bids":[["10.00","9"]],"asks":[["10.05","2"]]})");
     CHECK(m.depth5_checked == 3 && m.depth5_mismatch == 1);
     CHECK(s.bids.level(0) == (Level{1000000000, 900000000}));
@@ -219,7 +236,6 @@ void test_spot_sync(const fs::path& dir) {
     CHECK(all_26);
     CHECK(rows == 8 && rows == static_cast<int>(m.ob_rows.load()));
 
-    // replay of the market data file must give back the same order book file
     Metrics rm;
     fs::path replay_dir = dir / "replay";
     fs::create_directories(replay_dir);
@@ -242,7 +258,6 @@ void test_usdm_sync(const fs::path& dir) {
          R"({"e":"depthUpdate","E":2,"T":2,"s":"BTCUSDT","U":51,"u":60,"pu":50,"b":[["100.0","2"]],"a":[]})");
     CHECK(s.last_update_id == 60 && s.bids.level(0).qty == 200000000);
 
-    // usdm depth5 ids fall inside the next diff's range: the snapshot is folded in, then the diff applied
     feed(StreamKind::Depth5,
          R"({"e":"depthUpdate","E":3,"T":3,"s":"BTCUSDT","U":61,"u":65,"pu":60,"b":[["100.0","7"]],"a":[["100.1","1"]]})");
     CHECK(s.check_pending && s.bids.level(0).qty == 200000000);
@@ -271,7 +286,6 @@ void test_rest_snapshot(const fs::path& dir) {
     feed(StreamKind::DepthDiff, R"({"e":"depthUpdate","E":2,"s":"BTCUSDT","U":104,"u":106,"b":[],"a":[["10.20","4"]]})");
     CHECK(s.valid && s.last_update_id == 106);
 
-    // snapshot behind the live book: caught up with the kept diffs, then swapped in
     feed(StreamKind::RestSnapshot,
          R"({"lastUpdateId":102,"bids":[["10.00","1"],["9.90","2"],["9.80","7"]],"asks":[["10.10","3"],["10.30","6"]]})");
     CHECK(m.rest_snapshots == 1 && m.rest_applied == 1 && !s.rest_pending);
@@ -281,9 +295,8 @@ void test_rest_snapshot(const fs::path& dir) {
     CHECK(s.bids.level(3) == (Level{980000000, 700000000}));
     CHECK(s.asks.level(1) == (Level{1020000000, 400000000}));
     CHECK(s.asks.level(2) == (Level{1030000000, 600000000}));
-    CHECK(m.rest_top_mismatch == 1);  // the live book only knew 2 bid levels
+    CHECK(m.rest_top_mismatch == 1);
 
-    // snapshot ahead of the live book: waits until a diff brings both to the same id
     feed(StreamKind::RestSnapshot,
          R"({"lastUpdateId":110,"bids":[["10.00","1"],["9.95","5"],["9.70","9"]],"asks":[["10.10","3"],["10.20","4"]]})");
     CHECK(s.rest_pending && m.rest_applied == 1);
@@ -292,15 +305,13 @@ void test_rest_snapshot(const fs::path& dir) {
     feed(StreamKind::DepthDiff, R"({"e":"depthUpdate","E":4,"s":"BTCUSDT","U":109,"u":112,"b":[],"a":[["10.40","8"]]})");
     CHECK(!s.rest_pending && m.rest_applied == 2 && s.last_update_id == 112);
     CHECK(s.bids.level(2) == (Level{970000000, 900000000}));
-    CHECK(s.bids.size() == 3);  // 9.60 was gone again by id 110
+    CHECK(s.bids.size() == 3);
     CHECK(s.asks.level(2) == (Level{1040000000, 800000000}));
 
-    // snapshot so old that the kept diffs don't connect to it: dropped, book untouched
     feed(StreamKind::RestSnapshot, R"({"lastUpdateId":50,"bids":[["1.00","1"]],"asks":[["2.00","1"]]})");
     CHECK(m.rest_dropped == 1 && !s.rest_pending && m.rest_applied == 2);
     CHECK(s.bids.level(0) == (Level{1000000000, 100000000}));
 
-    // after a reconnect the book is reset; a snapshot seeds it straight away
     feed(StreamKind::DepthDiff, R"({"e":"depthUpdate","E":5,"s":"BTCUSDT","U":113,"u":115,"b":[],"a":[]})", 1);
     CHECK(!s.valid);
     feed(StreamKind::RestSnapshot, R"({"lastUpdateId":200,"bids":[["10.00","2"]],"asks":[["10.10","2"]]})", 1);
@@ -308,7 +319,6 @@ void test_rest_snapshot(const fs::path& dir) {
     feed(StreamKind::DepthDiff, R"({"e":"depthUpdate","E":6,"s":"BTCUSDT","U":201,"u":205,"b":[["10.00","4"]],"a":[]})", 1);
     CHECK(s.last_update_id == 205 && s.bids.level(0).qty == 400000000);
 
-    // a gap in the live book while a continuous REST book is pending: reset, then the REST book takes over
     feed(StreamKind::RestSnapshot, R"({"lastUpdateId":210,"bids":[["10.00","4"],["9.00","1"]],"asks":[["10.10","2"]]})", 1);
     CHECK(s.rest_pending);
     feed(StreamKind::DepthDiff, R"({"e":"depthUpdate","E":7,"s":"BTCUSDT","U":208,"u":212,"b":[],"a":[]})", 1);
@@ -323,7 +333,6 @@ void test_rest_snapshot(const fs::path& dir) {
     CHECK(read_file(dir / "ob_rest.csv") == read_file(replay_dir / "market_data_rest_orderbook.csv"));
     CHECK(rm.rest_applied == 4);
 
-    // usdm: the snapshot id falls inside a diff's range, pu decides continuity
     Metrics um;
     Processor up(Venue::Usdm, um);
     CHECK(up.add_symbol(SymbolOutput{"BTCUSDT", "", (dir / "ob_rest_usdm.csv").string()}));
@@ -341,7 +350,7 @@ void test_rest_snapshot(const fs::path& dir) {
     up.close();
 }
 
-}  // namespace
+}
 
 int main() {
     fs::path dir = fs::temp_directory_path() / "binance_lob_unit_tests";

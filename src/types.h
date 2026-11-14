@@ -1,3 +1,15 @@
+// This file has the small shared pieces: the Venue and StreamKind enums with their CSV names,
+// the two clocks, and RawMessage, which is one message (combined-stream envelope already
+// removed) sitting in the queue between the network thread and the book thread. Replay
+// rebuilds the exact same RawMessage from a market data CSV row, so the book code can't tell
+// live and replay apart. I kept two clocks on purpose. wall_clock_ns() is the receive time
+// that goes into the CSVs. mono_clock_ns() uses steady_clock and is only for measuring
+// durations (that's what recv_mono_ns is for, it's never written anywhere), because WSL steps
+// the wall clock when it re-syncs and my first runs showed a fake max latency of up to 2 s.
+// RestSnapshot isn't a WebSocket stream, it's the REST /depth reply (only with
+// --rest-snapshot), but it still goes into the market data file like the others, so replay
+// sees exactly what live saw.
+
 #pragma once
 
 #include <chrono>
@@ -7,21 +19,15 @@
 
 enum class Venue { Spot, Usdm };
 
-// Wall clock in nanoseconds since the epoch, written to the CSVs as receive time.
 inline std::int64_t wall_clock_ns() {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch())
         .count();
 }
 
-// Monotonic clock for measuring durations. The wall clock can jump when the OS
-// adjusts it (WSL does this often), which would show up as fake latency.
 inline std::int64_t mono_clock_ns() {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
         .count();
 }
-// RestSnapshot is not a WebSocket stream: it is the REST /depth response
-// (only with --rest-snapshot), written to the market data file like the rest
-// so replay sees exactly what live saw.
 enum class StreamKind : std::uint8_t { DepthDiff, Depth5, Trade, RestSnapshot };
 
 inline const char* venue_name(Venue v) {
@@ -52,11 +58,9 @@ inline bool parse_stream_kind(std::string_view s, StreamKind& out) {
     return false;
 }
 
-// One inbound message with the combined-stream envelope removed.
-// Replay mode rebuilds exactly this from a market data CSV row.
 struct RawMessage {
     std::int64_t recv_ns = 0;
-    std::int64_t recv_mono_ns = 0;  // only for latency stats, not written anywhere
+    std::int64_t recv_mono_ns = 0;
     std::uint32_t shard_id = 0;
     std::uint32_t conn_epoch = 0;
     std::uint64_t conn_seq = 0;
