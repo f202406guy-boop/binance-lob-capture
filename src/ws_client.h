@@ -84,6 +84,7 @@ private:
     std::string frame_;
     std::uint32_t epoch_ = 0;
     std::uint64_t conn_seq_ = 0;
+    std::int64_t recv_mono_ns_ = 0;
     int backoff_ms_ = 500;
     bool connected_ = false;
     bool stopping_ = false;

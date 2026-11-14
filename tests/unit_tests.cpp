@@ -9,6 +9,7 @@
 
 #include "csv.h"
 #include "decimal.h"
+#include "latency.h"
 #include "metrics.h"
 #include "order_book.h"
 #include "processor.h"
@@ -99,6 +100,35 @@ void test_book_side() {
     CHECK(b.level(2) == (Level{96, 7}));
     CHECK(b.level(3) == (Level{95, 1}));
     CHECK(b.top_matches(snap));
+
+    BookSide a(false);
+    a.set(101, 1);
+    a.set(103, 1);
+    a.set(104, 1);
+    a.set(106, 1);
+    std::vector<Level> asnap = {{100, 5}, {103, 6}, {105, 7}};
+    a.replace_top(asnap);
+    CHECK(a.size() == 4);
+    CHECK(a.level(0) == (Level{100, 5}));
+    CHECK(a.level(2) == (Level{105, 7}));
+    CHECK(a.level(3) == (Level{106, 1}));
+    CHECK(a.top_matches(asnap));
+}
+
+void test_latency() {
+    LatencyHistogram h;
+    CHECK(h.percentile(50) == 0 && h.count() == 0);
+    for (int us = 1; us <= 100; ++us) h.add(us * 1000LL);
+    CHECK(h.count() == 100);
+    CHECK(h.percentile(50) == 50);
+    CHECK(h.percentile(99) == 99);
+    CHECK(h.percentile(100) == 100);
+    CHECK(h.max() == 100);
+    h.add(50 * 1000 * 1000LL);  // 50 ms, past the last bucket
+    CHECK(h.max() == 50000);
+    CHECK(h.percentile(100) == LatencyHistogram::kBuckets);
+    h.add(-5);
+    CHECK(h.count() == 102);
 }
 
 struct Feeder {
@@ -238,6 +268,7 @@ int main() {
     test_decimal();
     test_csv();
     test_book_side();
+    test_latency();
     test_spot_sync(dir);
     test_usdm_sync(dir);
 

@@ -21,12 +21,6 @@ constexpr std::size_t kMaxMessageBytes = 1 << 20;
 constexpr int kMinBackoffMs = 500;
 constexpr int kMaxBackoffMs = 30000;
 
-std::int64_t wall_clock_ns() {
-    return std::chrono::duration_cast<std::chrono::nanoseconds>(
-               std::chrono::system_clock::now().time_since_epoch())
-        .count();
-}
-
 std::string to_lower(std::string s) {
     for (char& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
     return s;
@@ -162,6 +156,7 @@ void WsClient::on_read(std::uint32_t epoch, beast::error_code ec) {
         if (stopping_) return;
         return fail(epoch, "read", ec);
     }
+    recv_mono_ns_ = mono_clock_ns();
     std::int64_t recv_ns = wall_clock_ns();
     handle_frame(recv_ns);
     buffer_.consume(buffer_.size());
@@ -205,6 +200,7 @@ void WsClient::push(const Route& route, std::string_view data, std::int64_t recv
     }
 
     slot->recv_ns = recv_ns;
+    slot->recv_mono_ns = recv_mono_ns_;
     slot->shard_id = 0;
     slot->conn_epoch = epoch_;
     slot->conn_seq = conn_seq_++;

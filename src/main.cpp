@@ -16,6 +16,7 @@
 
 #include <boost/asio/signal_set.hpp>
 
+#include "latency.h"
 #include "metrics.h"
 #include "processor.h"
 #include "replay.h"
@@ -35,6 +36,7 @@ struct Options {
     std::vector<std::string> symbols;
     std::string output_dir = "./output";
     long duration_sec = 0;
+    bool busy_poll = false;
     std::vector<std::string> replay_files;
 };
 
@@ -42,7 +44,7 @@ void usage() {
     std::fprintf(stderr,
                  "usage:\n"
                  "  binance_capture --venue spot|usdm --symbols BTCUSDT[,ETHUSDT...] [--output-dir DIR] "
-                 "[--duration SECONDS]\n"
+                 "[--duration SECONDS] [--busy-poll]\n"
                  "  binance_capture --replay FILE[,FILE...] [--output-dir DIR]\n");
 }
 
@@ -92,6 +94,8 @@ bool parse_args(int argc, char** argv, Options& opt) {
             if (!v) return false;
             opt.duration_sec = std::strtol(v, nullptr, 10);
             if (opt.duration_sec < 0) return false;
+        } else if (arg == "--busy-poll") {
+            opt.busy_poll = true;
         } else if (arg == "--replay") {
             const char* v = next();
             if (!v) return false;
@@ -137,13 +141,23 @@ std::string free_base_name(const fs::path& dir, const std::string& base) {
     return (dir / name).string();
 }
 
-void run_consumer(MessageQueue& queue, Processor& processor, const std::atomic<bool>& producer_done) {
+// The book thread. By default it yields a few times and then sleeps 200 us
+// when the queue is empty, which keeps CPU near zero but means a message can
+// wait up to a few hundred us before it is picked up. --busy-poll keeps
+// checking instead: wait drops to about 1 us, but one core runs at 100%.
+void run_consumer(MessageQueue& queue, Processor& processor, const std::atomic<bool>& producer_done,
+                  bool busy_poll, LatencyStats& latency) {
     auto last_flush = std::chrono::steady_clock::now();
+    auto last_report = last_flush;
     int idle = 0;
     while (true) {
         RawMessage* msg = queue.front();
         if (msg) {
+            std::int64_t start = mono_clock_ns();
             processor.process(*msg);
+            std::int64_t end = mono_clock_ns();
+            latency.wait.add(start - msg->recv_mono_ns);
+            latency.work.add(end - start);
             queue.pop();
             idle = 0;
             continue;
@@ -157,6 +171,11 @@ void run_consumer(MessageQueue& queue, Processor& processor, const std::atomic<b
             processor.flush();
             last_flush = now;
         }
+        if (now - last_report > std::chrono::seconds(10)) {
+            latency.print(stderr, "[latency]");
+            last_report = now;
+        }
+        if (busy_poll) continue;
         if (++idle < 64)
             std::this_thread::yield();
         else
@@ -187,7 +206,8 @@ int run_live(const Options& opt) {
 
     auto queue = std::make_unique<MessageQueue>();
     std::atomic<bool> producer_done{false};
-    std::thread consumer([&] { run_consumer(*queue, processor, producer_done); });
+    LatencyStats latency;
+    std::thread consumer([&] { run_consumer(*queue, processor, producer_done, opt.busy_poll, latency); });
 
     int rc = 0;
     try {
@@ -238,6 +258,7 @@ int run_live(const Options& opt) {
     consumer.join();
     processor.close();
     metrics.print(stderr, "[final]");
+    latency.print(stderr, "[final latency]");
     return rc;
 }
 
