@@ -54,15 +54,21 @@ target_link_libraries(unit_tests PRIVATE lob_core)
 target_compile_options(unit_tests PRIVATE ${WARNINGS})
 add_test(NAME unit_tests COMMAND unit_tests)
 
+# benchmark behind the --busy-poll choice (see README), not part of the tests
+add_executable(wait_bench bench/wait_bench.cpp)
+target_include_directories(wait_bench PRIVATE src)
+target_link_libraries(wait_bench PRIVATE Threads::Threads)
+target_compile_options(wait_bench PRIVATE ${WARNINGS})
+
 if(ENABLE_ASAN)
-  foreach(t lob_core binance_capture unit_tests)
+  foreach(t lob_core binance_capture unit_tests wait_bench)
     target_compile_options(${t} PRIVATE -fsanitize=address,undefined -fno-omit-frame-pointer)
     target_link_options(${t} PRIVATE -fsanitize=address,undefined)
   endforeach()
 endif()
 
 if(ENABLE_TSAN)
-  foreach(t lob_core binance_capture unit_tests)
+  foreach(t lob_core binance_capture unit_tests wait_bench)
     target_compile_options(${t} PRIVATE -fsanitize=thread)
     target_link_options(${t} PRIVATE -fsanitize=thread)
   endforeach()
