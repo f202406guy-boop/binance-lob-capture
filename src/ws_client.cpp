@@ -63,7 +63,7 @@ Endpoint make_endpoint(Venue venue, const std::vector<std::string>& symbols) {
 }
 
 WsClient::WsClient(net::io_context& ioc, ssl::context& ssl_ctx, Venue venue, const std::vector<std::string>& symbols,
-                   MessageQueue& queue, Metrics& metrics, bool rest_snapshot)
+                   MessageQueue& queue, Metrics& metrics, bool rest_snapshot, int rest_parallel)
     : ioc_(ioc),
       ssl_ctx_(ssl_ctx),
       endpoint_(make_endpoint(venue, symbols)),
@@ -73,8 +73,11 @@ WsClient::WsClient(net::io_context& ioc, ssl::context& ssl_ctx, Venue venue, con
       resolver_(ioc),
       retry_timer_(ioc),
       close_timer_(ioc),
-      rest_(ioc, ssl_ctx),
       rest_enabled_(rest_snapshot) {
+    for (int i = 0; i < std::max(rest_parallel, 1); ++i) {
+        rest_.push_back(std::make_unique<RestClient>(ioc, ssl_ctx));
+        rest_busy_.push_back(false);
+    }
     for (std::uint32_t i = 0; i < symbols.size(); ++i) {
         std::string lower = to_lower(symbols[i]);
         for (int k = 0; k < 3; ++k) routes_.emplace(lower + kSuffixes[k], Route{i, kKinds[k]});
@@ -175,22 +178,26 @@ void WsClient::on_ws_handshake(std::uint32_t epoch, beast::error_code ec) {
     }
 }
 
-// Fetches the REST snapshots one symbol after another, to keep the request
-// weight low. If a request from an old connection is still in flight we wait
-// for it; its on_snapshot() continues the loop for the current connection.
+// Fetches the REST snapshots, one symbol per idle RestClient, so at most
+// rest_parallel requests are in flight. A client that still waits for a request
+// from an old connection is skipped; its on_snapshot() calls us again.
 void WsClient::next_snapshot() {
-    if (stopping_ || !connected_ || rest_busy_ || rest_next_ >= symbols_.size()) return;
-    std::uint32_t epoch = epoch_;
-    std::uint32_t index = rest_next_;
-    std::string target = rest_path_ + "?symbol=" + symbols_[index] + "&limit=1000";
-    rest_busy_ = true;
-    rest_.get(rest_host_, target, [this, epoch, index](int status, std::string body) {
-        on_snapshot(epoch, index, status, std::move(body));
-    });
+    for (std::size_t c = 0; c < rest_.size(); ++c) {
+        if (stopping_ || !connected_ || rest_next_ >= symbols_.size()) return;
+        if (rest_busy_[c]) continue;
+        std::uint32_t epoch = epoch_;
+        std::uint32_t index = rest_next_++;
+        std::string target = rest_path_ + "?symbol=" + symbols_[index] + "&limit=1000";
+        rest_busy_[c] = true;
+        rest_[c]->get(rest_host_, target, [this, c, epoch, index](int status, std::string body) {
+            on_snapshot(c, epoch, index, status, std::move(body));
+        });
+    }
 }
 
-void WsClient::on_snapshot(std::uint32_t epoch, std::uint32_t index, int status, std::string body) {
-    rest_busy_ = false;
+void WsClient::on_snapshot(std::size_t client, std::uint32_t epoch, std::uint32_t index, int status,
+                           std::string body) {
+    rest_busy_[client] = false;
     if (stopping_) return;
     // A snapshot from an old connection is dropped and rest_next_ stays as the
     // new handshake set it. A failed request was already logged; skip that symbol.
@@ -201,7 +208,6 @@ void WsClient::on_snapshot(std::uint32_t epoch, std::uint32_t index, int status,
             std::fprintf(stderr, "[rest] %s snapshot %zu bytes (epoch=%u)\n", symbols_[index].c_str(), body.size(),
                          epoch);
         }
-        ++rest_next_;
         // 429 = too many requests, 418 = IP banned for not backing off after a
         // 429. Stop asking on this connection; the books use depth5 seeding.
         if (status == 429 || status == 418) {
@@ -308,7 +314,7 @@ void WsClient::stop() {
     stopping_ = true;
     retry_timer_.cancel();
     resolver_.cancel();
-    rest_.stop();
+    for (auto& rest : rest_) rest->stop();
     if (!ws_) return;
 
     if (connected_ && ws_->is_open()) {

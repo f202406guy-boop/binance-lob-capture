@@ -30,6 +30,7 @@ namespace {
 
 constexpr std::size_t kMaxSymbols = 50;
 constexpr std::size_t kMaxTargetLength = 4096;
+constexpr long kMaxRestParallel = 8;
 
 struct Options {
     Venue venue = Venue::Spot;
@@ -38,6 +39,7 @@ struct Options {
     long duration_sec = 0;
     bool busy_poll = false;
     bool rest_snapshot = false;
+    int rest_parallel = 4;
     std::vector<std::string> replay_files;
 };
 
@@ -45,7 +47,7 @@ void usage() {
     std::fprintf(stderr,
                  "usage:\n"
                  "  binance_capture --venue spot|usdm --symbols BTCUSDT[,ETHUSDT...] [--output-dir DIR] "
-                 "[--duration SECONDS] [--busy-poll] [--rest-snapshot]\n"
+                 "[--duration SECONDS] [--busy-poll] [--rest-snapshot] [--rest-parallel N]\n"
                  "  binance_capture --replay FILE[,FILE...] [--output-dir DIR]\n");
 }
 
@@ -93,12 +95,22 @@ bool parse_args(int argc, char** argv, Options& opt) {
         } else if (arg == "--duration") {
             const char* v = next();
             if (!v) return false;
-            opt.duration_sec = std::strtol(v, nullptr, 10);
-            if (opt.duration_sec < 0) return false;
+            char* end = nullptr;
+            opt.duration_sec = std::strtol(v, &end, 10);
+            if (end == v || *end != '\0' || opt.duration_sec < 0) return false;
         } else if (arg == "--busy-poll") {
             opt.busy_poll = true;
         } else if (arg == "--rest-snapshot") {
             opt.rest_snapshot = true;
+        } else if (arg == "--rest-parallel") {
+            const char* v = next();
+            if (!v) return false;
+            long n = std::strtol(v, nullptr, 10);
+            if (n < 1 || n > kMaxRestParallel) {
+                std::fprintf(stderr, "--rest-parallel must be between 1 and %ld\n", kMaxRestParallel);
+                return false;
+            }
+            opt.rest_parallel = static_cast<int>(n);
         } else if (arg == "--replay") {
             const char* v = next();
             if (!v) return false;
@@ -222,7 +234,7 @@ int run_live(const Options& opt) {
         ssl_ctx.set_default_verify_paths();
         ssl_ctx.set_verify_mode(ssl::verify_peer);
 
-        WsClient client(ioc, ssl_ctx, opt.venue, opt.symbols, *queue, metrics, opt.rest_snapshot);
+        WsClient client(ioc, ssl_ctx, opt.venue, opt.symbols, *queue, metrics, opt.rest_snapshot, opt.rest_parallel);
         net::signal_set signals(ioc, SIGINT, SIGTERM);
         net::steady_timer duration_timer(ioc);
         net::steady_timer stats_timer(ioc);

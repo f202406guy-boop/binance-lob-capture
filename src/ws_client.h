@@ -3,6 +3,7 @@
 #include <chrono>
 #include <cstdint>
 #include <map>
+#include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -43,11 +44,13 @@ Endpoint make_endpoint(Venue venue, const std::vector<std::string>& symbols);
 // connection epoch, and a handler from an old connection just returns.
 //
 // With rest_snapshot it also fetches a REST depth snapshot for every symbol
-// after each handshake, one symbol at a time, and queues it as RestSnapshot.
+// after each handshake, up to rest_parallel symbols at a time, and queues it as
+// RestSnapshot.
 class WsClient {
 public:
     WsClient(boost::asio::io_context& ioc, boost::asio::ssl::context& ssl_ctx, Venue venue,
-             const std::vector<std::string>& symbols, MessageQueue& queue, Metrics& metrics, bool rest_snapshot);
+             const std::vector<std::string>& symbols, MessageQueue& queue, Metrics& metrics, bool rest_snapshot,
+             int rest_parallel);
 
     void start();
     void stop();
@@ -73,7 +76,7 @@ private:
     void push(const Route& route, std::string_view data, std::int64_t recv_ns);
     void close_socket();
     void next_snapshot();
-    void on_snapshot(std::uint32_t epoch, std::uint32_t index, int status, std::string body);
+    void on_snapshot(std::size_t client, std::uint32_t epoch, std::uint32_t index, int status, std::string body);
 
     boost::asio::io_context& ioc_;
     boost::asio::ssl::context& ssl_ctx_;
@@ -84,7 +87,8 @@ private:
     boost::asio::ip::tcp::resolver resolver_;
     boost::asio::steady_timer retry_timer_;
     boost::asio::steady_timer close_timer_;
-    RestClient rest_;
+    std::vector<std::unique_ptr<RestClient>> rest_;
+    std::vector<bool> rest_busy_;  // one flag per RestClient
     std::vector<std::string> symbols_;  // uppercase, for the REST url
     std::string rest_host_;
     std::string rest_path_;
@@ -100,7 +104,6 @@ private:
     bool connected_ = false;
     bool stopping_ = false;
     bool rest_enabled_ = false;
-    bool rest_busy_ = false;
     bool rest_started_ = false;
     std::uint32_t rest_next_ = 0;
     std::chrono::steady_clock::time_point last_rest_round_;
